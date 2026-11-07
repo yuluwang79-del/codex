@@ -2,7 +2,7 @@
 const JSZip = require('../vendor/jszip.min.js');
 const E = require('../engine.js');
 global.JSZip = JSZip;
-const options = {month:10,process:'喷粉',factory:'一厂',materialSheet:'xl/worksheets/sheet1.xml',orderSheet:'xl/worksheets/sheet1.xml',materialHeader:1,orderHeader:1,materialMap:{dd:'A',code:'B',quantity:'C',mark:'D',factory:'E'},orderMap:{dd:'A',code:'B',quantity:'C',mark:'D'}};
+const options = {materialCustomer:'测试客户',orderCustomer:'测试客户',month:10,process:'喷粉',factory:'一厂',materialSheet:'xl/worksheets/sheet1.xml',orderSheet:'xl/worksheets/sheet1.xml',materialHeader:1,orderHeader:1,materialMap:{dd:'A',code:'B',quantity:'C',mark:'D',factory:'E'},orderMap:{dd:'A',code:'B',quantity:'C',mark:'D'}};
 const escape = value => String(value).replace(/&/g,'&amp;').replace(/</g,'&lt;');
 async function book(name, rows, extra='') {
  const zip=new JSZip();

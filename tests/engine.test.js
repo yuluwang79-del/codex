@@ -24,11 +24,9 @@ test('duplicates retained; exact row beats sequence; explicit priority beats exa
  r=await run([m(8)],[o(3),o(8)],{priorityRows:[2]});assert.deepEqual(r.flows.map(f=>f.quantity),['3','5']);
  r=await run([m(1)],[o(1),o(1)]);assert.equal(r.results.length,2);assert.equal(r.results[1].status,'missing');
 });
-test('excluded factory key is review and blocks entire export; explicit confirmed alias recovers it',async()=>{
- const r=await run([m(5,'','制造一部')],[o(5)]);assert.equal(r.stats.missing,0);assert.equal(r.diagnostics.matchedBeforeFilter,1);assert.equal(r.diagnostics.matchedAfterFilter,0);assert.equal(r.results[0].scopeEvidence[0].factory,'制造一部');
- await assert.rejects(E.exportResult(r),/禁止批量/);
- const fixed=await run([m(5,'','制造一部')],[o(5)],{factoryAliases:[['制造一部','一厂']]});assert.equal(fixed.stats.full,1);
- const other=await run([m(5),m(20,'','二厂')],[o(10)]);assert.equal(other.stats.newQuantity,'5');assert.equal(other.stats.partial,1);assert.equal(other.flows.length,1);assert.equal(other.flows[0].materialRow,2);assert.equal(other.results[0].remaining,'5');
+test('manufacturing department never excludes in-house work; shared residual ledger crosses departments',async()=>{
+ const r=await run([m(5,'','制造一部')],[o(5)]);assert.equal(r.stats.full,1);assert.equal(r.diagnostics.matchedBeforeFilter,1);assert.equal(r.diagnostics.matchedAfterFilter,1);assert.equal(r.results[0].scopeEvidence[0].factory,'制造一部');await E.exportResult(r);
+ const other=await run([m(5),m(20,'','二厂')],[o(10)]);assert.equal(other.stats.newQuantity,'10');assert.equal(other.stats.full,1);assert.deepEqual(other.flows.map(f=>[f.materialRow,f.quantity]),[[2,'5'],[3,'5']]);
 });
 test('version suffix and DD are preserved; only true absent keys get no-key',async()=>{
  const r=await run([m(4)],[o(4,'','001-A.V3'),['DD002','001-A.V2',1,'']]);assert.equal(r.stats.missing,2);assert.equal(r.stats.newQuantity,'0');
@@ -91,4 +89,35 @@ test('historical quantity credits an order only when its own annotation confirms
 test('fully consumed historical material is exhausted, without rewriting prior material evidence',async()=>{
  const r=await run([m(5,'9月厂内')],[o(5)]);assert.equal(r.stats.missing,1);assert.equal(r.results[0].reasonCode,'exhausted');assert.equal(r.changes[0].size,0);assert.equal(r.results[0].after,'无此订单');
  const files=await E.exportResult(r);const again=E.analyze(...await Promise.all(files.map(f=>E.readWorkbook(f.bytes,f.name))),options);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);
+});
+test('customer is required even with DD+code match; an unrelated customer cannot supply or consume history',async()=>{
+ const [mw,ow]=await pair([m(5)],[o(5)]);
+ assert.throws(()=>E.analyze(mw,ow,{...options,materialCustomer:'',orderCustomer:''}),/未识别客户列/);
+ const r=E.analyze(mw,ow,{...options,materialCustomer:'客户甲',orderCustomer:'客户乙'});assert.equal(r.stats.newQuantity,'0');assert.equal(r.stats.review,1);assert.equal(r.results[0].reasonCode,'customer-mismatch');assert.equal(r.changes[0].size+r.changes[1].size,0);
+});
+test('customer columns partition identical DD+code; equal customer spans departments but never other customers',async()=>{
+ const mw=await book('客户物料.xlsx',[['专案名称','图号','数量','喷粉','厂区','客户'],['DD001','A',4,'','一厂','甲'],['DD001','A',6,'','二厂','甲'],['DD001','A',100,'','三厂','乙']]);
+ const ow=await book('客户订单.xlsx',[['DD号','物料','数量','喷粉','客户'],['DD001','A',5,'','甲'],['DD001','A',7,'','乙']]);
+ const cfg={...options,materialMap:{...options.materialMap,customer:'F'},orderMap:{...options.orderMap,customer:'E'}};
+ assert.equal(E.detect(mw.sheets[0],'material','喷粉').map.customer,'F');assert.equal(E.detect(ow.sheets[0],'order','喷粉').map.customer,'E');
+ const r=E.analyze(mw,ow,cfg);assert.deepEqual(r.flows.map(f=>[f.customer,f.materialRow,f.orderRow,f.quantity]),[['甲',2,2,'4'],['甲',3,2,'1'],['乙',4,3,'7']]);
+ const exported=await E.exportResult(r);const again=E.analyze(...await Promise.all(exported.map(f=>E.readWorkbook(f.bytes,f.name))),cfg);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);
+});
+test('numeric historical cell is preserved and reviewed without blocking unrelated valid work',async()=>{
+ const [mw,ow]=await pair([m(5,'10'),['DD002','B',5,'','二厂']],[o(5),['DD002','B',5,'']]);
+ const r=E.analyze(mw,ow,options);assert.equal(r.stats.review,1);assert.equal(r.stats.full,1);assert.equal(r.stats.newQuantity,'5');assert(!r.changes[0].has('D2'));assert(!r.changes[1].has('D2'));assert.match(r.results[0].reason,/第2行.*历史/);await E.exportResult(r);
+});
+test('delivery-date cell must not be inferred as factory; vertical merged customer cells resolve to their anchor',async()=>{
+ const w=await book('表.xlsx',[['厂区：','送货日期：26年10月'],['专案名称','图号','数量','喷粉','客户'],['DD001','A',4,'','甲'],['DD001','A',6,'','']],'<mergeCells count="1"><mergeCell ref="E3:E4"/></mergeCells>');
+ assert.equal(E.metadata(w,'喷粉').sheets[0].factory,'');
+ const ow=await book('订单.xlsx',[['DD号','物料','数量','喷粉','客户'],['DD001','A',5,'','甲']]);
+ const r=E.analyze(w,ow,{...options,materialHeader:2,materialMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'},orderMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'}});assert.equal(r.stats.newQuantity,'5');assert.deepEqual(r.flows.map(f=>f.quantity),['4','1']);
+});
+test('skip erroneous numeric history only for that source record; clear same-key rows still supply the order',async()=>{
+ const r=await run([m(50,'10'),m(6,'','二厂')],[o(5)]);assert.equal(r.stats.full,1);assert.equal(r.stats.newQuantity,'5');assert.deepEqual(r.flows.map(f=>[f.materialRow,f.quantity]),[[3,'5']]);assert(!r.changes[0].has('D2'));const files=await E.exportResult(r);const again=E.analyze(...await Promise.all(files.map(f=>E.readWorkbook(f.bytes,f.name))),options);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);
+});
+test('selected customer restricts writes while matching all records for diagnostic evidence',async()=>{
+ const mw=await book('物料.xlsx',[['专案名称','图号','数量','喷粉','客户'],['DD001','A',5,'','甲'],['DD001','A',7,'','乙']]);const ow=await book('需求.xlsx',[['DD号','物料','数量','喷粉','客户'],['DD001','A',5,'','甲'],['DD001','A',7,'','乙']]);
+ const cfg={...options,customer:'甲',materialMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'},orderMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'}};
+ const r=E.analyze(mw,ow,cfg);assert.equal(r.stats.newQuantity,'5');assert.equal(r.diagnostics.scopedOrderCount,1);assert.equal(r.results[1].reasonCode,'customer-filtered');assert.equal(r.results[0].scopeEvidence.length,2);assert(!r.changes[0].has('D3'));assert(!r.changes[1].has('D3'));assert.equal(r.flows[0].customer,'甲');await E.exportResult(r);
 });
