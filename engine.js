@@ -8,6 +8,7 @@
   const txt = s => [...String(s).replace(/<(?:\w+:)?rPh\b[\s\S]*?<\/(?:\w+:)?rPh>/g, '').matchAll(/<(?:\w+:)?t\b[^>]*>([\s\S]*?)<\/(?:\w+:)?t>/g)].map(m => dec(m[1])).join('');
   const colNo = s => [...s].reduce((a, c) => a * 26 + c.charCodeAt(0) - 64, 0);
   const colName = n => { let s = ''; while (n) { n--; s = String.fromCharCode(65 + n % 26) + s; n = Math.floor(n / 26); } return s; };
+  const quantityMarkHeader = value => /^(?:(?:\d{1,2}月)?(?:喷粉|喷漆|丝印|组装|压铆|打胶))?(?:已对数量|已核数量|已核销数量|核销数量|消单数量)$/.test(norm(value));
   const keyOf = (dd, code) => norm(dd) + '\u001f' + norm(code);
   const qty = v => {
     const s = String(v ?? '').trim().replace(/,/g, '');
@@ -78,11 +79,11 @@
       .map(({ column, header }) => ({ column, header }));
     best.map.customer = customerCandidates.length === 1 ? customerCandidates[0].column : '';
     best.customerCandidates = customerCandidates;
-    const protectedHeader = value => /数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼|名称|名稱|单位|單位|厂区|廠區|制造|製造/i.test(value);
-    const candidates = Object.entries(paths).map(([column, parts]) => ({ column, header: parts.join(' / ') }))
-      .filter(v => !protectedHeader(v.header) && /核销|核銷|消单|消單|备注|備註|喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
+    const protectedHeader = value => !quantityMarkHeader(value) && /数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼|名称|名稱|单位|單位|厂区|廠區|制造|製造/i.test(value);
+    const candidates = Object.entries(paths).map(([column, parts]) => ({ column, header: parts.join(' / '), leaf: sheet.byRow.get(best.headerRow)?.values[column] || parts.at(-1) || '' }))
+      .filter(v => !protectedHeader(v.leaf) && (quantityMarkHeader(v.leaf) || /核销|核銷|消单|消單|备注|備註|喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header)));
     const explicit = candidates.filter(v => norm(v.header).includes(norm(process)));
-    const generic = candidates.filter(v => /核销|核銷|消单|消單/.test(v.header) && !/喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
+    const generic = candidates.filter(v => (/核销|核銷|消单|消單/.test(v.header) || quantityMarkHeader(v.leaf)) && !/喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
     const eligible = explicit.length ? explicit : generic;
     best.map.mark = eligible.length === 1 ? eligible[0].column : '';
     best.candidates = candidates;
@@ -120,7 +121,7 @@
       const preamble = s.rows.slice(0, 4).flatMap(r => Object.values(r.values)).join(' ');
       const factory = s.rows.slice(0, 4).flatMap(r => Object.values(r.values)).map(v => String(v).trim().match(/^(?:厂区|廠區)[：:]\s*([^：:]+)$/)?.[1]?.trim()).find(Boolean) || '';
       const period = preamble.match(/(20\d{2}|\d{2})年\s*(\d{1,2})月/);
-      const factories = [...new Set(s.rows.filter(r => r.row > material.headerRow).map(r => r.values[material.map.factory]).filter(Boolean))].slice(0, 20);
+      const factories = [...new Set(s.rows.filter(r => r.row > material.headerRow).map(r => r.values[material.map.factory]).filter(Boolean))];
       const customerColumn = material.map.customer || order.map.customer;
       const customers = [...new Set(s.rows.filter(r => r.row > Math.max(material.headerRow, order.headerRow)).map(r => r.values[customerColumn]).filter(Boolean))];
       const maxCol = Math.max(15, ...s.rows.slice(0, 20).flatMap(r => Object.keys(r.values).map(colNo)));
@@ -205,8 +206,8 @@
       for (const column of Object.values(map).filter(Boolean)) if (!/^[A-Z]{1,3}$/.test(column)) throw Error('字段列号无效');
       const detected = detect(sheet, label === '厂内' ? 'material' : 'order', cfg.process);
       const rawHeader = sheet.byRow.get(+header)?.values[map.mark] || '';
-      const title = rawHeader + ' ' + (detected.headers[map.mark] || '');
-      if (/数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼/i.test(title) ||
+      const title = rawHeader || detected.headers[map.mark] || '';
+      if ((!quantityMarkHeader(title) && /数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼/i.test(title)) ||
           Object.entries(map).some(([key, value]) => key !== 'mark' && value === map.mark)) throw Error(label + '核销列属于原始数据，禁止写入：' + title);
       // Numeric annotations are reviewed per record; they never imply zero history.
       if (sheet.rows.some(row => row.row > +header && row.formulas.has(map.mark))) throw Error(label + '核销列含公式，禁止写入');
@@ -214,7 +215,7 @@
       if ((sheet.merges || []).some(m => colNo(map.mark) >= m.c1 && colNo(map.mark) <= m.c2 && m.r2 > +header)) throw Error(label + '核销目标含合并数据格，需人工确认');
     }
     for (const [label, map, fixed] of [['厂内物料', mm, cfg.materialCustomer], ['月度订单', om, cfg.orderCustomer]]) {
-      if (!map.customer && !norm(fixed)) throw Error(label + '未识别客户列。请在字段映射中选择客户列；仅在整份表确属同一客户时填写该表客户。');
+      if (!map.customer && !norm(fixed)) throw Error(label + '未识别客户列。请在字段映射中选择客户列；也可为当前工作表明确指定统一客户，不改原表。');
     }
     const customerOf = (row, map, fixed, sheet) => {
       if (!map.customer) return String(fixed || '').trim();
@@ -269,7 +270,7 @@
       const mats = index.get(key) || [], evidence = allIndex.get(keyOf(group[0].dd, group[0].code)) || [];
       if (!mats.length && evidence.length) group.forEach(o => {
         o.issue ||= '同DD号＋图号仅找到其他客户或客户缺失记录：' + evidence.map(m => '第' + m.row + '行 客户“' + (m.customer || '空白') + '”').join('；');
-        o.issueCode = 'customer-mismatch';
+        o.issueCode ||= 'customer-mismatch';
       });
       if (mats.some(m => m.issue && !m.skipHistory)) group.forEach(o => { o.issue ||= '同键厂内历史或字段不明确：' + mats.filter(m => m.issue).map(m => '第' + m.row + '行 ' + m.issue).join('；'); });
     }
@@ -381,6 +382,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.07.3', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.07.4', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);

@@ -140,3 +140,12 @@ test('multiple customer columns require explicit choice; customer order number i
  const w=await book('虚构.xlsx',[['DD号','物料','数量','喷粉消单','所属客户名称','终端客户','客户订单号'],['DD001','A',5,'','甲','乙','客户单001']]);
  const d=E.detect(w.sheets[0],'order','喷粉');assert.equal(d.map.customer,'');assert.deepEqual(d.customerCandidates.map(c=>c.column),['E','F']);assert.equal(d.map.mark,'D');
 });
+test('worksheet customer bound explicitly to order factory/customer column; dedicated 已对数量 is writable, raw quantity is protected',async()=>{
+ const mw=await book('虚构厂内.xlsx',[['制造部门','专案名称','图号','物料名称','','','订单数量','','喷粉消单'],['一厂','DD001','A-01','侧板','','',10,'','8月厂内1']]);
+ const ow=await book('虚构月度需求.xlsx',[['序号','外发日期','厂区','DD号','物料','名称','颜色','数量','单价','总额','已对数量'],[1,'10月1日','虚构客户甲','DD001','A-01','侧板','白',9,10,90,''],[2,'10月1日','虚构客户乙','DD001','A-01','侧板','白',9,10,90,'']]);
+ const mm=E.detect(mw.sheets[0],'material','喷粉').map,detected=E.detect(ow.sheets[0],'order','喷粉');assert.equal(mm.customer,'');assert.equal(mm.mark,'I');assert.equal(detected.map.quantity,'H');assert.equal(detected.map.mark,'K');
+ const cfg={...options,customer:'虚构客户甲',materialCustomer:'虚构客户甲',materialMap:mm,orderMap:{...detected.map,customer:'C'}};
+ const r=E.analyze(mw,ow,cfg);assert.equal(r.stats.newQuantity,'9');assert.equal(r.results[1].reasonCode,'customer-filtered');assert.deepEqual([...r.changes[0].keys()],['I2']);assert.deepEqual([...r.changes[1].keys()],['K2']);
+ assert.throws(()=>E.analyze(mw,ow,{...cfg,orderMap:{...cfg.orderMap,mark:'H'}}),/同一列|原始数据/);
+ const files=await E.exportResult(r);const out=await Promise.all(files.map(f=>E.readWorkbook(f.bytes,f.name)));assert.equal(out[0].sheets[0].byRow.get(2).values.I,'8月厂内1，10月厂内9');assert.equal(out[1].sheets[0].byRow.get(2).values.K,'10月已对');assert.equal(out[1].sheets[0].byRow.get(2).values.H,'9');assert.equal(out[1].sheets[0].byRow.get(2).values.J,'90');const again=E.analyze(...out,cfg);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);
+});
