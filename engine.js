@@ -47,7 +47,7 @@
     code: ['图号', '圖號', '物料', '物料号', '物料编码', '物料編碼', '物料编号'],
     name: ['物料名称', '物料描述', '名称', '品名'],
     quantity: ['订单数量', '訂單數量', '数量', '數量'],
-    customer: ['客户', '客户名称', '客户简称', '客戶', '客戶名稱', '客戶簡稱', '需求客户'],
+    customer: ['所属客户', '所属客户名称', '客户全称', '客户名', '需求客户名称', '客户', '客户名称', '客户简称', '客戶', '客戶名稱', '客戶簡稱', '需求客户'],
     factory: ['制造部门', '製造部門', '厂区', '廠區', '厂别'], unit: ['单位', '單位']
   };
   function detect(sheet, role, process) {
@@ -73,6 +73,11 @@
       }
       for (const [c, value] of Object.entries(values)) (paths[c] ||= []).push(String(value));
     }
+    const customerCandidates = Object.entries(paths).map(([column, parts]) => ({ column, header: parts.join(' / '), leaf: sheet.byRow.get(best.headerRow)?.values[column] || parts.at(-1) || '' }))
+      .filter(c => /客户|客戶|CUSTOMER/i.test(norm(c.leaf)) && !/订单|訂單|单号|單號|DD|图号|圖號|物料|数量|數量|价格|價格|金额|金額|日期|地址|电话|電話|联系人|聯繫人|消单|消單|核销|核銷|喷粉|喷漆/i.test(c.leaf))
+      .map(({ column, header }) => ({ column, header }));
+    best.map.customer = customerCandidates.length === 1 ? customerCandidates[0].column : '';
+    best.customerCandidates = customerCandidates;
     const protectedHeader = value => /数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼|名称|名稱|单位|單位|厂区|廠區|制造|製造/i.test(value);
     const candidates = Object.entries(paths).map(([column, parts]) => ({ column, header: parts.join(' / ') }))
       .filter(v => !protectedHeader(v.header) && /核销|核銷|消单|消單|备注|備註|喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
@@ -188,6 +193,12 @@
       if (new Set(['dd', 'code', 'quantity', 'mark'].map(k => map[k])).size !== 4) throw Error(label + '的关键字段不能映射到同一列。');
     }
     if (materialWb.bytes.length === orderWb.bytes.length && materialWb.bytes.every((b, i) => b === orderWb.bytes[i])) throw Error('两份文件内容完全相同，请上传厂内物料总表及对应订单，不能将同一份表互相核销。');
+    // Customer is a read-only grouping field, never the historical annotation column.
+    for (const [sheet, map, header, label] of [[ms, mm, cfg.materialHeader, '厂内'], [os, om, cfg.orderHeader, '订单']]) if (map.customer) {
+      const title = sheet.byRow.get(+header)?.values[map.customer] || detect(sheet, label === '厂内' ? 'material' : 'order', cfg.process).headers[map.customer] || '';
+      if (['dd', 'code', 'quantity', 'mark', 'name', 'unit'].some(key => map[key] === map.customer) || /消单|消單|核销|核銷|喷粉|喷漆|丝印|组装|压铆|打胶|备注|備註|数量|數量|价格|價格|金额|金額|单价|單價|日期|图号|圖號|物料|DD/i.test(title))
+        throw Error(label + '“客户”误选为' + map.customer + '列“' + title + '”。请改选真实客户列；本工序核销列保持' + map.mark + '列不变，原表无需改列。');
+    }
     // Validate write targets in the engine too; UI validation is not a safety boundary.
     for (const [sheet, map, header, label] of [[ms, mm, cfg.materialHeader, '厂内'], [os, om, cfg.orderHeader, '订单']]) {
       if (!Number.isInteger(+header) || +header < 1) throw Error(label + '表头行无效');
@@ -370,6 +381,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.07.2', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.07.3', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);

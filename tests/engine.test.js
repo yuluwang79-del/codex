@@ -121,3 +121,22 @@ test('selected customer restricts writes while matching all records for diagnost
  const cfg={...options,customer:'甲',materialMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'},orderMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E'}};
  const r=E.analyze(mw,ow,cfg);assert.equal(r.stats.newQuantity,'5');assert.equal(r.diagnostics.scopedOrderCount,1);assert.equal(r.results[1].reasonCode,'customer-filtered');assert.equal(r.results[0].scopeEvidence.length,2);assert(!r.changes[0].has('D3'));assert(!r.changes[1].has('D3'));assert.equal(r.flows[0].customer,'甲');await E.exportResult(r);
 });
+test('screenshot-shaped original workbook: recognize client F and keep powder history I, only patch original annotation cells',async()=>{
+ const mw=await book('虚构原始厂内表.xlsx',[['制造部门','专案名称','图号','物料名称','规格','所属客户名称','订单数量','日期','喷粉消单'],['一厂','DD001','A-01','原图号取消侧板','X','甲',10,'2026-10-01','8月厂内1'],['二厂','DD001','A-01','侧板','X','乙',10,'2026-10-02','']]);
+ const ow=await book('虚构客户需求.xlsx',[['客户全称','DD号','物料号','数量','10月喷粉核销','金额','日期'],['甲','DD001','A-01',9,'',100,'2026-10-03'],['乙','DD001','A-01',4,'',200,'2026-10-04']]);
+ const mm=E.detect(mw.sheets[0],'material','喷粉').map,om=E.detect(ow.sheets[0],'order','喷粉').map;assert.equal(mm.customer,'F');assert.equal(mm.mark,'I');assert.equal(om.customer,'A');assert.equal(om.mark,'E');
+ const cfg={...options,materialMap:mm,orderMap:om};
+ assert.throws(()=>E.analyze(mw,ow,{...cfg,materialMap:{...mm,customer:'I'}}),/客户.*误选为I列.*喷粉消单.*核销列保持I列不变/);
+ const r=E.analyze(mw,ow,cfg);assert.equal(r.stats.newQuantity,'13');assert.deepEqual([...r.changes[0].keys()],['I2','I3']);assert.deepEqual([...r.changes[1].keys()],['E2','E3']);
+ const files=await E.exportResult(r);const out=await Promise.all(files.map(f=>E.readWorkbook(f.bytes,f.name)));
+ assert.equal(out[0].sheets[0].byRow.get(2).values.I,'8月厂内1，10月厂内9');
+ for(let i=0;i<2;i++){
+  const changes=r.changes[i];const strip=xml=>xml.replace(/<c\b([^>]*r="([A-Z]+\d+)"[^>]*)>[\s\S]*?<\/c>/g,(cell,attrs,ref)=>changes.has(ref)?'<ALLOWED '+ref+'/>':cell);
+  assert.equal(strip(out[i].sheets[0].xml),strip(r.sheets[i].xml));
+ }
+ const again=E.analyze(...out,cfg);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);
+});
+test('multiple customer columns require explicit choice; customer order number is not a customer name',async()=>{
+ const w=await book('虚构.xlsx',[['DD号','物料','数量','喷粉消单','所属客户名称','终端客户','客户订单号'],['DD001','A',5,'','甲','乙','客户单001']]);
+ const d=E.detect(w.sheets[0],'order','喷粉');assert.equal(d.map.customer,'');assert.deepEqual(d.customerCandidates.map(c=>c.column),['E','F']);assert.equal(d.map.mark,'D');
+});
