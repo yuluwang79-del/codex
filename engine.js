@@ -382,6 +382,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.07.4', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.07.5', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);
