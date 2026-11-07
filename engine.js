@@ -20,7 +20,7 @@
   };
   const fmt = q => { const neg = q < 0n; if (neg) q = -q; const f = String(q % SCALE).padStart(6, '0').replace(/0+$/, ''); return (neg ? '-' : '') + String(q / SCALE) + (f ? '.' + f : ''); };
   const min = (a, b) => a < b ? a : b;
-  function parseRows(xml, strings) {
+  function parseRows(xml, strings, zeroFormats = []) {
     const rows = []; const rowRe = /<(?:\w+:)?row\b([^>]*?)(?:\/>|>([\s\S]*?)<\/(?:\w+:)?row>)/g;
     let m;
     while ((m = rowRe.exec(xml))) {
@@ -28,10 +28,11 @@
       while ((c = cells.exec(m[2] || ''))) {
         const ref = attr(c[1], 'r'); const col = ref.replace(/\d/g, ''); const body = c[2] || ''; const type = attr(c[1], 't'); const vm = body.match(/<(?:\w+:)?v\b[^>]*>([\s\S]*?)<\/(?:\w+:)?v>/); let value = vm ? dec(vm[1]) : type === 'inlineStr' ? txt(body) : '';
         if (type === 's') { if (!/^\d+$/.test(value) || strings[+value] === undefined) throw Error('共享字符串引用损坏：' + ref); value = strings[+value]; }
+        if ((!type || type === 'n') && /^\d+$/.test(value)) { const format = zeroFormats[+attr(c[1], 's') || 0]; if (format) value = value.padStart(format, '0'); }
         if (/<(?:\w+:)?f\b/.test(body)) formulas.add(col);
         if (value !== '') values[col] = value;
       }
-      if (Object.keys(values).length) rows.push({ row: r, values, formulas });
+      if (Object.keys(values).length || formulas.size) rows.push({ row: r, values, formulas });
     }
     return rows;
   }
@@ -53,14 +54,37 @@
     for (const r of sheet.rows.slice(0, 40)) {
       const cells = Object.entries(r.values); const headers = Object.fromEntries(cells.map(([c, v]) => [norm(v).replace(/[：:]/g, ''), c])); const map = {};
       for (const [k, words] of Object.entries(aliases)) for (const word of words) if (!map[k] && headers[norm(word)]) map[k] = headers[norm(word)];
-      map.mark = cells.find(([, v]) => norm(v).includes(norm(process)) && /消单|消單|核销|核銷/.test(v))?.[0] || cells.find(([, v]) => norm(v) === norm(process))?.[0] || '';
-      if (role === 'order' && !map.mark) map.mark = cells.find(([, v]) => ['备注', '核销备注', '消单备注'].includes(norm(v)))?.[0] || '';
       const specific = role === 'material' ? (headers['专案名称'] ? 8 : 0) + (headers['图号'] ? 6 : 0) + (headers['订单数量'] ? 4 : 0) : (headers['DD号'] ? 6 : 0) + (headers['物料'] ? 5 : 0) + (headers['日期'] || headers['外发日期'] ? 3 : 0);
       const score = (map.dd ? 5 : 0) + (map.code ? 5 : 0) + (map.quantity ? 5 : 0) + specific;
       if (!best || score > best.score) best = { headerRow: r.row, score, map, headers: r.values };
     }
-    return best || { headerRow: 1, score: 0, map: {}, headers: {} };
+    if (!best) return { headerRow: 1, score: 0, map: {}, headers: {}, candidates: [] };
+    // Preserve the literal header paths, including merged parent headers.
+    const headerRows = sheet.rows.filter(r => r.row >= best.headerRow - 2 && r.row <= best.headerRow + 2 &&
+      (r.row <= best.headerRow || ((!r.values[best.map.dd] || aliases.dd.some(v => norm(v) === norm(r.values[best.map.dd]))) &&
+       !/^[+-]?\d+(?:\.\d+)?$/.test(String(r.values[best.map.quantity] || '')) && Object.values(r.values).some(v => /核销|核銷|消单|消單|备注|備註|日期|数量|數量|DD号|图号|物料/.test(v)))));
+    const paths = {};
+    for (const row of headerRows) {
+      const values = { ...row.values };
+      for (const merge of sheet.merges || []) if (merge.r1 === row.row) {
+        const value = row.values[colName(merge.c1)];
+        if (value) for (let c = merge.c1; c <= merge.c2; c++) values[colName(c)] ||= value;
+      }
+      for (const [c, value] of Object.entries(values)) (paths[c] ||= []).push(String(value));
+    }
+    const protectedHeader = value => /数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼|名称|名稱|单位|單位|厂区|廠區|制造|製造/i.test(value);
+    const candidates = Object.entries(paths).map(([column, parts]) => ({ column, header: parts.join(' / ') }))
+      .filter(v => !protectedHeader(v.header) && /核销|核銷|消单|消單|备注|備註|喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
+    const explicit = candidates.filter(v => norm(v.header).includes(norm(process)));
+    const generic = candidates.filter(v => /核销|核銷|消单|消單/.test(v.header) && !/喷粉|喷漆|丝印|组装|压铆|打胶/.test(v.header));
+    const eligible = explicit.length ? explicit : generic;
+    best.map.mark = eligible.length === 1 ? eligible[0].column : '';
+    best.candidates = candidates;
+    best.headers = Object.fromEntries(Object.entries(paths).map(([c, values]) => [c, values.join(' / ')]));
+    best.headerEnd = Math.max(best.headerRow, ...headerRows.map(r => r.row));
+    return best;
   }
+
   async function readWorkbook(data, name) {
     if (!/\.xlsx$/i.test(name)) throw Error('请使用 .xlsx 文件；旧版 .xls 请先另存为 .xlsx。');
     const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
@@ -69,16 +93,20 @@
     const wbxml = await zip.file('xl/workbook.xml').async('string'); const relxml = await zip.file('xl/_rels/workbook.xml.rels')?.async('string') || '';
     const rels = new Map([...relxml.matchAll(/<(?:\w+:)?Relationship\b([^>]*?)(?:\/>|>)/g)].map(m => [attr(m[1], 'Id'), attr(m[1], 'Target')]));
     const sxml = await zip.file('xl/sharedStrings.xml')?.async('string') || '';
+    const styleXml = await zip.file('xl/styles.xml')?.async('string') || '';
+    const formats = new Map([...styleXml.matchAll(/<(?:\w+:)?numFmt\b([^>]*?)(?:\/>|>)/g)].map(m => [attr(m[1], 'numFmtId'), attr(m[1], 'formatCode')]));
+    const cellXfs = styleXml.match(/<(?:\w+:)?cellXfs\b[^>]*>([\s\S]*?)<\/(?:\w+:)?cellXfs>/)?.[1] || '';
+    const zeroFormats = [...cellXfs.matchAll(/<(?:\w+:)?xf\b([^>]*?)(?:\/>|>)/g)].map(m => { const f = formats.get(attr(m[1], 'numFmtId')) || ''; return /^0+$/.test(f) ? f.length : 0; });
     const strings = [...sxml.matchAll(/<(?:\w+:)?si\b[^>]*>([\s\S]*?)<\/(?:\w+:)?si>/g)].map(m => txt(m[1])); const sheets = [];
     for (const m of wbxml.matchAll(/<(?:\w+:)?sheet\b([^>]*?)(?:\/>|>)/g)) {
       const target = rels.get(attr(m[1], 'r:id')); if (!target) continue;
       const path = pathJoin('xl', target); const entry = zip.file(path); if (!entry) continue;
       const xml = await entry.async('string'); if (xml.length > 130000000) throw Error('单张表过大，请拆成较小的业务文件。');
-      const rows = parseRows(xml, strings); const sheet = { name: attr(m[1], 'name'), state: attr(m[1], 'state') || 'visible', path, xml, rows, byRow: new Map(rows.map(r => [r.row, r])) };
+      const rows = parseRows(xml, strings, zeroFormats); const merges = [...xml.matchAll(/<(?:\w+:)?mergeCell\b[^>]*ref="([A-Z]+)(\d+):([A-Z]+)(\d+)"/g)].map(m => ({ c1: colNo(m[1]), r1: +m[2], c2: colNo(m[3]), r2: +m[4] })); const sheet = { merges, name: attr(m[1], 'name'), state: attr(m[1], 'state') || 'visible', path, xml, rows, byRow: new Map(rows.map(r => [r.row, r])) };
       sheets.push(sheet);
     }
     if (!sheets.length) throw Error('没有找到可读取的工作表。');
-    return { name, bytes, zip, sheets, strings, signed: Object.keys(zip.files).some(p => p.startsWith('_xmlsignatures/')), meta: metadata({ name, sheets }, '喷粉') };
+    return { name, bytes, zip, sheets, strings, zeroFormats, signed: Object.keys(zip.files).some(p => p.startsWith('_xmlsignatures/')), meta: metadata({ name, sheets }, '喷粉') };
   }
   function metadata(wb, process) {
     return { name: wb.name, sheets: wb.sheets.map(s => {
@@ -86,22 +114,26 @@
       const preamble = s.rows.slice(0, 4).flatMap(r => Object.values(r.values)).join(' ');
       const factory = preamble.match(/厂区[：:]\s*([^\s]+)/)?.[1] || '';
       const period = preamble.match(/(20\d{2}|\d{2})年\s*(\d{1,2})月/);
-      const factories = [...new Set(s.rows.slice(material.headerRow).map(r => r.values[material.map.factory]).filter(Boolean))].slice(0, 20);
+      const factories = [...new Set(s.rows.filter(r => r.row > material.headerRow).map(r => r.values[material.map.factory]).filter(Boolean))].slice(0, 20);
       const maxCol = Math.max(15, ...s.rows.slice(0, 20).flatMap(r => Object.keys(r.values).map(colNo)));
-      return { name: s.name, path: s.path, state: s.state, rowCount: s.rows.length, material, order, factory, factories, period: period ? { year: +period[1] < 100 ? 2000 + +period[1] : +period[1], month: +period[2] } : null, columns: Array.from({ length: Math.min(maxCol + 3, 80) }, (_, i) => colName(i + 1)), sample: s.rows.slice(0, 6).map(r => ({ row: r.row, values: r.values })) };
+      return { name: s.name, path: s.path, state: s.state, rowCount: s.rows.length, material, order, factory, factories, period: period ? { year: +period[1] < 100 ? 2000 + +period[1] : +period[1], month: +period[2] } : null, columns: Array.from({ length: Math.min(maxCol + 3, 16384) }, (_, i) => colName(i + 1)), sample: s.rows.slice(0, 6).map(r => ({ row: r.row, values: r.values })) };
     }) };
   }
   function numberMonth(text) {
     const names = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二'];
     return text.replace(/(十二|十一|十|九|八|七|六|五|四|三|二|一)月/g, (_, n) => (names.indexOf(n) + 1) + '月').replace(/(\d{1,2})內厂/g, '$1月厂');
   }
-  function parseHistory(text, total, month, continuous) {
+  function parseHistory(text, total, month, continuous, unit = '', process = '') {
     const raw = numberMonth(norm(text)); if (!raw) return { used: 0n, current: 0n, entries: [] };
     const parts = raw.split(/[,，;；\n]+/).filter(Boolean); let used = 0n, current = 0n, last = null; const entries = [];
     for (const part of parts) {
       let m = part.match(/^(\d{1,2})月(厂内|达康|天跃|祺隆|众创)(?:喷粉|喷漆|喷)?(?:以对|已对|对)?([\d.]+)?(?:件|张|套)?$/);
       if (!m && continuous && last && /^[\d.]+(?:件|张|套)?$/.test(part)) m = ['', last.month, last.vendor, part.replace(/[件张套]/g, '')];
       if (!m) throw Error('历史标注无法确定数量：' + text);
+      const writtenProcess = part.match(/喷粉|喷漆|丝印|组装|压铆|打胶/)?.[0];
+      if (process && writtenProcess && writtenProcess !== process) throw Error('历史原文明示其他工序，需核实：' + text);
+      const writtenUnit = part.match(/(件|张|套)$/)?.[1];
+      if (writtenUnit && ((unit && norm(unit) !== writtenUnit) || (!unit && writtenUnit !== '件'))) throw Error('历史单位与原数量单位不明或不一致：' + text);
       const mo = +m[1]; if (mo < 1 || mo > 12 || mo > month) throw Error('历史月份超出本次口径：' + text);
       const q = m[3] ? qty(m[3]) : total; if (q < 0n) throw Error('历史数量异常');
       used += q; if (mo === month && m[2] === '厂内') current += q;
@@ -113,14 +145,29 @@
   function parseOrderMark(text, total, month) {
     const s = numberMonth(norm(text)); if (!s || s === '无此订单') return { applied: 0n, recognized: false, current: 0n };
     if ([...s.matchAll(/(\d{1,2})月/g)].some(m => +m[1] > month || +m[1] < 1)) throw Error('订单历史月份超出本次口径');
-    let m = [...s.matchAll(/累计([\d.]+)件/g)].at(-1); if (m) { const q = qty(m[1]); if (q > total) throw Error('订单累计核销超出数量'); const past = s.match(/^(\d{1,2})月(?:厂内(?:以对|已对|对)|以对|已对)([\d.]+)/); return { applied: q, current: past && +past[1] !== month ? q - qty(past[2]) : q, recognized: true }; }
-    m = s.match(/(?:只能对|可对)([\d.]+)(?:件|张|套)/) || s.match(/\d{1,2}月(?:厂内(?:以对|已对|对)|已对|以对)([\d.]+)(?:件|张|套)?/);
-    if (m) { const q = qty(m[1]); if (q > total) throw Error('订单核销标注超出数量'); const dated = s.match(/^(\d{1,2})月(?:厂内|已对|以对)/); return { applied: q, current: dated && +dated[1] !== month ? 0n : q, recognized: true }; }
-    m = s.match(/(\d{1,2})月(?:已对|以对|厂内)(?![\d对以已])/);
-    if (m) return { applied: total, current: +m[1] === month ? total : 0n, recognized: true };
-    if (/\d月.*(?:对|厂内)/.test(s)) throw Error('订单核销状态无法解析');
-    return { applied: 0n, current: 0n, recognized: false };
+    const segments = s.split(/[,，;；](?=\d{1,2}月补对)/);
+    const first = segments.shift();
+    let applied = 0n, current = 0n;
+    let m = first.match(/^(?:只能对|可对)([\d.]+)(?:件|张|套)$/);
+    if (m) { applied = qty(m[1]); current = applied; }
+    else {
+      m = first.match(/^(\d{1,2})月(?:厂内(?:以对|已对|对)?|已对|以对)([\d.]+)?(?:件|张|套)?$/);
+      if (!m) throw Error('订单标注含未确认历史，需核实：' + text);
+      applied = m[2] ? qty(m[2]) : total;
+      current = +m[1] === month ? applied : 0n;
+    }
+    for (const segment of segments) {
+      m = segment.match(/^(\d{1,2})月补对([\d.]+)件[（(]累计([\d.]+)件[,，](?:已对|尚余[\d.]+件)[）)]$/);
+      if (!m) throw Error('订单补对历史无法确认：' + text);
+      const added = qty(m[2]);
+      applied += added;
+      if (applied !== qty(m[3])) throw Error('订单补对数量与累计不一致：' + text);
+      if (+m[1] === month) current += added;
+    }
+    if (applied < 0n || applied > total) throw Error('订单累计核销超出数量');
+    return { applied, current, recognized: true };
   }
+
   function special(row, map) {
     const text = [row.values[map.dd], row.values[map.name], row.values[map.mark]].filter(Boolean).join(' ');
     if (/返喷|返修|退货|补料|不良/.test(text) || /取消/.test([row.values[map.dd], row.values[map.mark]].filter(Boolean).join(' '))) return '返喷、返修或其他异常业务，需单独核实';
@@ -138,13 +185,45 @@
       if (new Set(['dd', 'code', 'quantity', 'mark'].map(k => map[k])).size !== 4) throw Error(label + '的关键字段不能映射到同一列。');
     }
     if (materialWb.bytes.length === orderWb.bytes.length && materialWb.bytes.every((b, i) => b === orderWb.bytes[i])) throw Error('两份文件内容完全相同，请上传厂内物料总表及对应订单，不能将同一份表互相核销。');
+    // Validate write targets in the engine too; UI validation is not a safety boundary.
+    for (const [sheet, map, header, label] of [[ms, mm, cfg.materialHeader, '厂内'], [os, om, cfg.orderHeader, '订单']]) {
+      if (!Number.isInteger(+header) || +header < 1) throw Error(label + '表头行无效');
+      for (const column of Object.values(map).filter(Boolean)) if (!/^[A-Z]{1,3}$/.test(column)) throw Error('字段列号无效');
+      const detected = detect(sheet, label === '厂内' ? 'material' : 'order', cfg.process);
+      const rawHeader = sheet.byRow.get(+header)?.values[map.mark] || '';
+      const title = rawHeader + ' ' + (detected.headers[map.mark] || '');
+      if (/数量|數量|价格|價格|金额|金額|单价|單價|日期|DD|图号|圖號|物料|编码|編碼/i.test(title) ||
+          Object.entries(map).some(([key, value]) => key !== 'mark' && value === map.mark)) throw Error(label + '核销列属于原始数据，禁止写入：' + title);
+      if (sheet.rows.some(row => row.row > +header && /^[+-]?\d+(?:\.\d+)?$/.test(String(row.values[map.mark] || '').trim()))) throw Error(label + '核销列含纯数值，列的业务用途不明确，禁止覆盖');
+      if (sheet.rows.some(row => row.row > +header && row.formulas.has(map.mark))) throw Error(label + '核销列含公式，禁止写入');
+      if (detected.candidates.some(c => c.column === map.mark && /喷粉|喷漆|丝印|组装|压铆|打胶/.test(c.header) && !norm(c.header).includes(norm(cfg.process)))) throw Error(label + '核销列属于其他工序');
+      if ((sheet.merges || []).some(m => colNo(map.mark) >= m.c1 && colNo(map.mark) <= m.c2 && m.r2 > +header)) throw Error(label + '核销目标含合并数据格，需人工确认');
+    }
+    const factoryAliases = new Map();
+    for (const pair of cfg.factoryAliases || []) {
+      if (!Array.isArray(pair) || pair.length !== 2 || !norm(pair[0]) || !norm(pair[1])) throw Error('厂区别名必须逐行填写“原文=确认厂区”');
+      const [alias, canonical] = pair.map(norm);
+      if (factoryAliases.has(alias) && factoryAliases.get(alias) !== canonical) throw Error('厂区别名映射冲突');
+      factoryAliases.set(alias, canonical);
+    }
+    const factoryOf = value => factoryAliases.get(norm(value)) || norm(value);
+    if ([...factoryAliases.values()].some(v => factoryAliases.has(v) && factoryAliases.get(v) !== v)) throw Error('厂区别名不可链式或循环映射');
+    const factoryValues = [...new Set(ms.rows.filter(r => r.row > +cfg.materialHeader).map(r => factoryOf(r.values[mm.factory])).filter(Boolean))];
+    if (!cfg.factory && factoryValues.length > 1) throw Error('多个厂区必须先指定核销范围');
+    const allIndex = new Map(), excluded = [], blockers = [];
     const material = [], orders = [], index = new Map(), orderIndex = new Map(), changes = [new Map(), new Map()], flows = [];
     const monthText = cfg.month + '月', stats = { full: 0, partial: 0, missing: 0, review: 0, unchanged: 0, newQuantity: '0', materialChanges: 0, orderChanges: 0, groups: 0 };
     for (const row of ms.rows) {
       if (row.row <= +cfg.materialHeader || (!row.values[mm.dd] && !row.values[mm.code])) continue;
-      if (cfg.factory && mm.factory && row.values[mm.factory] && norm(row.values[mm.factory]) !== norm(cfg.factory)) continue;
+      const sourceKey = keyOf(row.values[mm.dd], row.values[mm.code]);
+      const rawFactory = row.values[mm.factory] || '';
+      const inScope = !cfg.factory || !mm.factory || (rawFactory && factoryOf(rawFactory) === factoryOf(cfg.factory));
+      const evidence = { row: row.row, factory: rawFactory, inScope, cell: mm.mark + row.row };
+      if (!allIndex.has(sourceKey)) allIndex.set(sourceKey, []);
+      allIndex.get(sourceKey).push(evidence);
+      if (!inScope) { excluded.push(evidence); continue; }
       const dd = row.values[mm.dd] || '', code = row.values[mm.code] || '', key = keyOf(dd, code); const t = { row: row.row, values: row.values, dd, code, key, name: row.values[mm.name] || '', old: row.values[mm.mark] || '', added: 0n, remaining: 0n, issue: '', total: 0n, used: 0n, current: 0n };
-      try { t.total = qty(row.values[mm.quantity]); if (t.total <= 0n) throw Error('厂内数量非正数'); const h = parseHistory(t.old, t.total, cfg.month, cfg.continuous); Object.assign(t, h); t.remaining = t.total - t.used; } catch (e) { t.issue = e.message; }
+      try { t.total = qty(row.values[mm.quantity]); if (t.total <= 0n) throw Error('厂内数量非正数'); const h = parseHistory(t.old, t.total, cfg.month, cfg.continuous, row.values[mm.unit] || '', cfg.process); Object.assign(t, h); t.remaining = t.total - t.used; } catch (e) { t.issue = e.message; }
       if (row.formulas.has(mm.mark)) t.issue = '核销目标格含公式，不允许覆盖';
       material.push(t); if (!index.has(key)) index.set(key, []); index.get(key).push(t);
     }
@@ -153,6 +232,7 @@
       const dd = row.values[om.dd] || '', code = row.values[om.code] || '', key = keyOf(dd, code); const t = { row: row.row, values: row.values, dd, code, key, name: row.values[om.name] || '', old: row.values[om.mark] || '', total: 0n, applied: 0n, current: 0n, remaining: 0n, added: 0n, issue: '', flows: [] };
       try { t.total = qty(row.values[om.quantity]); if (t.total <= 0n) throw Error('订单数量非正数'); Object.assign(t, parseOrderMark(t.old, t.total, cfg.month)); t.remaining = t.total - t.applied; } catch (e) { t.issue = e.message; }
       if (!/^DD[0-9A-Z]+$/.test(norm(dd)) || !norm(code)) t.issue = 'DD号缺失、带附注或异常业务标识，需核实';
+      if (cfg.factory && om.factory && factoryOf(row.values[om.factory]) !== factoryOf(cfg.factory)) t.issue = '订单厂区与本次范围不同或为空，需核实';
       const sp = special(row, om); if (sp) t.issue = sp;
       if (row.formulas.has(om.mark)) t.issue = '核销目标格含公式，不允许覆盖';
       orders.push(t); if (!orderIndex.has(key)) orderIndex.set(key, []); orderIndex.get(key).push(t);
@@ -166,11 +246,21 @@
       const mats = index.get(key) || []; const mu = new Set(mats.map(t => norm(t.values[mm.unit])).filter(Boolean)), ou = new Set(group.map(t => norm(t.values[om.unit])).filter(Boolean));
       if (mu.size && ou.size && new Set([...mu, ...ou]).size > 1) { group.forEach(t => { t.issue = '同键两表单位不一致，禁止自动换算'; }); mats.forEach(t => { t.issue = '同键单位不一致'; }); }
     }
+    for (const [key, group] of orderIndex) {
+      const mats = index.get(key) || [], outside = (allIndex.get(key) || []).filter(m => !m.inScope);
+      if (outside.length && (!mats.length || outside.some(m => !m.factory))) {
+        const detail = outside.map(m => '第' + m.row + '行 厂区“' + (m.factory || '空白') + '”').join('；');
+        blockers.push('同键记录被厂区筛选排除：' + group.map(o => '订单第' + o.row + '行').join('、') + ' → ' + detail);
+        group.forEach(o => { o.issue ||= '同键在其他厂区或别名尚未确认：' + detail; o.issueCode = outside.some(m => !m.factory) ? 'unknown-factory' : 'factory-excluded'; });
+        mats.forEach(m => { m.issue ||= '同键厂区范围有歧义'; });
+      }
+      if (mats.some(m => m.issue)) group.forEach(o => { o.issue ||= '同键厂内历史或字段不明确：' + mats.filter(m => m.issue).map(m => '第' + m.row + '行 ' + m.issue).join('；'); });
+    }
     const valid = t => !t.issue && t.remaining > 0n;
     function allocate(o, m, amount) {
       if (amount <= 0n || amount > o.remaining || amount > m.remaining || m.issue) throw Error('分配台账校验失败，已停止写入。');
       o.remaining -= amount; o.added += amount; m.remaining -= amount; m.added += amount;
-      const f = { materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
+      const f = { materialFile: materialWb.name, materialSheet: ms.name, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: os.name, orderCell: om.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
     }
     if ((cfg.priorityRows || []).some(row => !orders.some(o => o.row === row))) throw Error('指定的优先行不在当前订单范围内，请核实原表行号。');
     // Explicitly prioritized order rows share the same residual ledger.
@@ -207,7 +297,7 @@
       if (label !== o.old && !o.issue) changes[1].set(om.mark + o.row, { before: o.old, after: label, row: o.row, quantity: fmt(o.added) });
       stats[status]++;
       const mats = index.get(o.key) || [];
-      results.push({ row: o.row, dd: o.dd, code: o.code, name: o.name, quantity: o.total > 0n ? fmt(o.total) : o.values[om.quantity] || '', previous: fmt(o.applied), added: fmt(o.added), remaining: fmt(o.remaining), status, reason, before: o.old, after: label, changed: changes[1].has(om.mark + o.row), cell: om.mark + o.row, allocations: o.flows, material: mats.map(m => ({ row: m.row, name: m.name, quantity: m.total > 0n ? fmt(m.total) : m.values[mm.quantity] || '', before: m.old, after: changes[0].get(mm.mark + m.row)?.after || m.old, added: fmt(m.added), remaining: fmt(m.remaining), issue: m.issue, cell: mm.mark + m.row })) });
+      results.push({ scopeEvidence: allIndex.get(o.key) || [], reasonCode: o.issue ? o.issueCode || 'history-or-fields-unclear' : !mats.length ? 'no-key' : o.added > 0n ? 'allocated' : o.applied > 0n ? 'existing' : 'exhausted', row: o.row, dd: o.dd, code: o.code, name: o.name, quantity: o.total > 0n ? fmt(o.total) : o.values[om.quantity] || '', previous: fmt(o.applied), added: fmt(o.added), remaining: fmt(o.remaining), status, reason, before: o.old, after: label, changed: changes[1].has(om.mark + o.row), cell: om.mark + o.row, allocations: o.flows, material: mats.map(m => ({ historyUsed: fmt(m.used), currentHistory: fmt(m.current), historyEntries: m.entries || [], row: m.row, name: m.name, quantity: m.total > 0n ? fmt(m.total) : m.values[mm.quantity] || '', before: m.old, after: changes[0].get(mm.mark + m.row)?.after || m.old, added: fmt(m.added), remaining: fmt(m.remaining), issue: m.issue, cell: mm.mark + m.row })) });
     }
     const sm = material.reduce((q, t) => q + t.added, 0n), so = orders.reduce((q, t) => q + t.added, 0n), sf = flows.reduce((q, f) => q + qty(f.quantity), 0n);
     if (sm !== so || so !== sf || material.some(m => !m.issue && (m.remaining < 0n || m.added + m.used > m.total)) || orders.some(o => !o.issue && o.added + o.applied > o.total)) throw Error('两表数量校验未通过，禁止导出。');
@@ -217,7 +307,9 @@
       const left = (index.get(key) || []).reduce((q, m) => q + m.added, 0n), right = (orderIndex.get(key) || []).reduce((q, o) => q + o.added, 0n); if (left !== right) throw Error('分组数量不一致');
     }
     Object.assign(stats, { newQuantity: fmt(sm), materialChanges: changes[0].size, orderChanges: changes[1].size, groups: affected.size, totalOrders: orders.length, totalMaterial: material.length });
-    return { config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
+    if (orders.length >= 50 && orders.filter(o => index.has(o.key)).length / orders.length < 0.05) blockers.push('当前范围同键匹配率低于5%，请检查工作表、表头、DD号、图号及厂区映射；尚未确认原因，禁止批量写入');
+    const diagnostics = { reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(o.key)).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded, blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, factory: cfg.factory, factoryAliases: cfg.factoryAliases || [], month: cfg.month, process: cfg.process };
+    return { diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
   }
   function replaceCells(sheet, changes, strings) {
     if (!changes.size) return sheet.xml;
@@ -251,6 +343,7 @@
   }
   async function exportResult(result, onProgress) {
     if (!result.verified) throw Error('请先完成核对。');
+    if (result.diagnostics?.blockers.length) throw Error('范围或映射存在疑点，禁止批量写入。' + result.diagnostics.blockers.join('；'));
     const workbooks = [result.materialWb, result.orderWb], output = [];
     for (let i = 0; i < 2; i++) {
       const wb = workbooks[i], sheet = result.sheets[i]; onProgress?.('校验' + (i === 0 ? '物料总表' : '月度订单') + '的改动范围…');
@@ -270,6 +363,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.10.21.2', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.07.1', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);
