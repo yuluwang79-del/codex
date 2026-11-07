@@ -1,7 +1,7 @@
 // Run with a locally installed Playwright and Chromium. All files are synthetic.
 const {test}=require('node:test');const assert=require('node:assert/strict');
 const http=require('node:http');const fs=require('node:fs/promises');const path=require('node:path');
-const {chromium}=require('playwright');const {pair,book}=require('./fixtures');
+const {chromium}=require('playwright');const {pair,book,multiBook}=require('./fixtures');
 test('browser upload → allocation detail → two XLSX downloads → reupload; customer selection, numeric history safety and ambiguous header',async()=>{
  const root=path.resolve(__dirname,'..');
  const server=http.createServer(async(req,res)=>{try{const file=path.resolve(root,'.'+new URL(req.url,'http://localhost').pathname.replace(/\/$/,'/index.html'));if(!file.startsWith(root+path.sep))throw Error('path');res.setHeader('Content-Type',file.endsWith('.js')?'application/javascript':file.endsWith('.css')?'text/css':'text/html');res.end(await fs.readFile(file));}catch{res.writeHead(404);res.end();}});
@@ -49,6 +49,15 @@ test('browser upload → allocation detail → two XLSX downloads → reupload; 
  await page.locator('[data-sheet="0"]').selectOption('xl/worksheets/sheet2.xml');assert.equal(await page.locator('[data-customer="0"]').inputValue(),'');await page.locator('[data-sheet="0"]').selectOption('xl/worksheets/sheet1.xml');assert.equal(await page.locator('[data-customer="0"]').inputValue(),'虚构客户甲');
  await page.locator('#analyze').click();await page.waitForFunction(()=>!document.querySelector('#results').hidden);assert.match(await page.locator('#message').innerText(),/厂内 1 个标注格、订单 1 个标注格/);await page.locator('#export').click();await page.waitForFunction(()=>!document.querySelector('#download-box').hidden);
  await page.locator('[data-customer="0"]').fill('');await page.locator('[data-customer="0"]').dispatchEvent('change');await page.locator('#analyze').click();await page.waitForFunction(()=>!document.querySelector('#results').hidden);assert.equal(await page.locator('[data-customer="0"]').inputValue(),'虚构客户甲');assert.match(await page.locator('#message').innerText(),/厂内 1 个标注格、订单 1 个标注格/);
+ // All factory tabs participate; row 2 in each factory remains independently inspectable.
+ const multiStock=await book('虚构各厂共用物料.xlsx',[['专案名称','图号','数量','喷粉','客户'],['DD001','A',4,'','虚构客户甲'],['DD001','A',6,'','虚构客户甲']]);
+ const multiOrders=await multiBook('虚构多厂月度.xlsx',[{name:'一厂',rows:[['DD号','物料','数量','喷粉','客户'],['DD001','A',6,'','虚构客户甲']]},{name:'二厂',rows:[['DD号','物料','数量','喷粉','客户'],['DD001','A',6,'','虚构客户甲']]},{name:'三厂',rows:[['DD号','物料','数量','喷粉','客户'],['DD001','A',1,'','其他客户']]}]);
+ await upload(0,multiStock);await upload(1,multiOrders);assert.equal(await page.locator('#all-order-sheets').isChecked(),true);await page.locator('#analyze').click();await page.waitForFunction(()=>!document.querySelector('#results').hidden);
+ const sheetSummary=await page.locator('#sheet-summary').innerText();assert.match(sheetSummary,/3 个订单工作表/);assert.match(sheetSummary,/二厂：1 条订单，本次 4 件/);assert.match(sheetSummary,/三厂：1 条订单，本次 0 件/);
+ await page.locator('tr[data-record="xl/worksheets/sheet2.xml!2"]').click();assert.match(await page.locator('#detail-content').innerText(),/二厂.*第 2 行/);assert.match(await page.locator('#detail-content').innerText(),/二厂!D2/);assert.match(await page.locator('#detail-content').innerText(),/4 件/);await page.locator('[data-close="detail"]').click();
+ await page.locator('#export').click();await page.waitForFunction(()=>!document.querySelector('#download-box').hidden);const multiFiles=[];
+ for(const prefix of ['厂内物料总表','月度订单']){const next=page.waitForEvent('download');await page.getByRole('link',{name:prefix+' ↓',exact:true}).click();const d=await next;multiFiles.push({name:d.suggestedFilename(),bytes:new Uint8Array(await fs.readFile(await d.path()))});}
+ await upload(0,multiFiles[0]);await upload(1,multiFiles[1]);await page.locator('#analyze').click();await page.waitForFunction(()=>!document.querySelector('#results').hidden);assert.match(await page.locator('#message').innerText(),/厂内 0 个标注格、订单 0 个标注格/);assert.match(await page.locator('#sheet-summary').innerText(),/3 个订单工作表/);
  await page.locator('#demo').click();await page.waitForFunction(()=>document.querySelector('#uploads').textContent.includes('示例_9月订单.xlsx')&&!document.querySelector('#demo').disabled);await page.locator('#analyze').click();await page.waitForFunction(()=>!document.querySelector('#results').hidden);assert.match(await page.locator('#scope-diagnostics').textContent(),/示例客户/);assert.match(await page.locator('#tbody').innerText(),/客户：示例客户/);assert.equal(await page.locator('#customers option[value="示例客户"]').count(),1);assert.equal(await page.locator('#export').isEnabled(),true);
  assert.deepEqual(errors,[]);assert(network.every(host=>host==='127.0.0.1'));
  }finally{await browser?.close();await new Promise(resolve=>server.close(resolve));}
