@@ -40,3 +40,18 @@ test('visiting another factory mapping does not lose confirmed factory-as-custom
  const second=o.sheets[1].path,settings={...cfg,orderFactoryIsCustomer:true,orderConfigs:{[second]:{header:1,map:{dd:'A',code:'B',quantity:'C',mark:'D',factory:'E'},customer:''}}};const r=E.analyze(m,o,settings);assert.equal(r.stats.newQuantity,'5');assert.equal(r.diagnostics.orderSheets[1].map.customer,'E');
  const explicit=E.analyze(m,o,{...settings,orderConfigs:{[second]:{...settings.orderConfigs[second],customer:'其他客户'}}});assert.equal(explicit.stats.newQuantity,'3');assert.equal(explicit.results[1].customer,'其他客户');assert.equal(explicit.results[1].added,'0');
 });
+test('select one factory, preserve every unselected sheet byte-for-byte, then reconcile the remaining factories with actual residual',async()=>{
+ const m=await stock([[5]]),o=await multiBook('单厂选择.xlsx',[{name:'一厂',rows:[head,row(4)]},{name:'二厂',rows:[head,row(4)]},{name:'三厂',rows:[head,row(4)]}]);
+ const second=o.sheets[1].path;const onlySecond={...cfg,orderSheetPaths:[second]};const r=E.analyze(m,o,onlySecond);assert.equal(r.stats.totalOrders,1);assert.equal(r.stats.newQuantity,'4');assert.equal(r.results[0].orderSheet,'二厂');assert.equal(r.diagnostics.orderScope,'selected');
+ const out=await exportedRerun(r,onlySecond);for(const index of [0,2])assert.equal(out[1].sheets[index].xml,o.sheets[index].xml);
+ const remaining={...cfg,orderSheetPaths:[o.sheets[2].path,o.sheets[0].path]};const later=E.analyze(...out,remaining);assert.equal(later.stats.newQuantity,'1');assert.deepEqual(later.results.map(x=>[x.orderSheet,x.added]),[['一厂','1'],['三厂','0']]);assert.equal(later.sheetChanges[1].has(second),false);const final=await exportedRerun(later,remaining);const all=E.analyze(...final,cfg);assert.equal(all.stats.newQuantity,'0');assert.equal(final[1].sheets[1].byRow.get(2).values.D,'10月已对');
+});
+test('multi-select shares residual in workbook order and validates empty, unknown and duplicate selections',async()=>{
+ const m=await stock([[6]]),o=await multiBook('多选.xlsx',[{name:'一厂',rows:[head,row(4)]},{name:'二厂',rows:[head,row(4)]},{name:'三厂',rows:[head,row(4)]}]);
+ const chosen={...cfg,orderSheetPaths:[o.sheets[2].path,o.sheets[1].path]};const r=E.analyze(m,o,chosen);assert.equal(r.stats.newQuantity,'6');assert.deepEqual(r.results.map(x=>[x.orderSheet,x.added]),[['二厂','4'],['三厂','2']]);await exportedRerun(r,chosen);
+ assert.throws(()=>E.analyze(m,o,{...cfg,orderSheetPaths:[]}),/至少选择一个/);assert.throws(()=>E.analyze(m,o,{...cfg,orderSheetPaths:['missing']}),/无效或重复/);assert.throws(()=>E.analyze(m,o,{...cfg,orderSheetPaths:[o.sheets[1].path,o.sheets[1].path]}),/无效或重复/);assert.throws(()=>E.analyze(m,o,{...chosen,priorityRows:[2]}),/一厂.*未勾选/);
+});
+test('unselected malformed factory does not block a valid chosen factory or get modified',async()=>{
+ const m=await stock([[5]]),o=await multiBook('未选坏表.xlsx',[{name:'一厂',rows:[head,row(2)]},{name:'二厂',rows:[['DD号','物料','数量','备注','客户'],row(2)]}]);
+ const chosen={...cfg,orderSheetPaths:[o.sheets[0].path]};const r=E.analyze(m,o,chosen);assert.equal(r.stats.newQuantity,'2');const out=await exportedRerun(r,chosen);assert.equal(out[1].sheets[1].xml,o.sheets[1].xml);assert.throws(()=>E.analyze(m,o,{...cfg,orderSheetPaths:[o.sheets[1].path]}),/二厂.*核销/);
+});

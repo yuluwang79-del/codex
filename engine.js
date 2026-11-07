@@ -201,12 +201,19 @@
   }
   function orderContexts(wb, cfg, selected) {
     const included = [], skipped = [];
+    let wanted = null;
+    if (cfg.orderSheetPaths !== undefined) {
+      if (!Array.isArray(cfg.orderSheetPaths) || !cfg.orderSheetPaths.length) throw Error('请至少选择一个要核对的厂区工作表。');
+      if (new Set(cfg.orderSheetPaths).size !== cfg.orderSheetPaths.length || cfg.orderSheetPaths.some(path=>typeof path!=='string'||!wb.sheets.some(s=>s.path===path))) throw Error('所选厂区工作表无效或重复，请重新选择。');
+      wanted = new Set(cfg.orderSheetPaths);
+    }
     for (const sheet of wb.sheets) {
-      if (!cfg.allOrderSheets && sheet !== selected) continue;
+      if (wanted ? !wanted.has(sheet.path) : !cfg.allOrderSheets && sheet !== selected) {skipped.push({name:sheet.name,path:sheet.path,reason:'本次未选择该厂区，原样保留',reasonCode:'not-selected'});continue;}
+
       const d = detect(sheet, 'order', cfg.process), saved = cfg.orderConfigs?.[sheet.path];
       const isSelected = sheet === selected;
       const coreCount = ['dd','code','quantity'].filter(key => d.map[key]).length;
-      const summary = cfg.allOrderSheets && /汇总|统计|说明|封面|合计/.test(sheet.name);
+      const summary = (cfg.allOrderSheets || wanted) && /汇总|统计|说明|封面|合计/.test(sheet.name);
       if (summary || (!isSelected && !saved && coreCount === 0)) {
         const hasDD = sheet.rows.some(r=>Object.values(r.values).some(v=>/^DD[0-9]/i.test(norm(v))));
         if (!summary && hasDD) throw Error('订单“'+sheet.name+'”含DD记录但无法识别表头，请切到该工作表确认映射。');
@@ -232,7 +239,7 @@
     validateSheetMapping(ms, mm, cfg.materialHeader, '厂内“' + ms.name + '”', cfg.process, cfg.materialCustomer);
     const {included:contexts,skipped:skippedOrderSheets} = orderContexts(orderWb, cfg, os);
     const orderSheetChanges = new Map(contexts.map(c => [c.sheet.path,new Map()]));
-    const orderChangeKey = o => cfg.allOrderSheets ? o.sheet.path + '!' + o.map.mark + o.row : o.map.mark + o.row;
+    const orderChangeKey = o => cfg.allOrderSheets || cfg.orderSheetPaths !== undefined ? o.sheet.path + '!' + o.map.mark + o.row : o.map.mark + o.row;
     const customerOf = (row, map, fixed, sheet) => {
       if (!map.customer) return String(fixed || '').trim();
       let value = row.values[map.customer];
@@ -299,6 +306,7 @@
       o.remaining -= amount; o.added += amount; m.remaining -= amount; m.added += amount;
       const f = { customer: o.customer, materialFile: materialWb.name, materialSheet: ms.name, materialPath: ms.path, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
     }
+    if ((cfg.priorityRows || []).length && !contexts.some(c=>c.sheet===os)) throw Error('优先行对应的工作表“'+os.name+'”本次未勾选，请勾选该厂区或清空优先行。');
     if ((cfg.priorityRows || []).some(row => !orders.some(o => o.row === row && o.sheet === os))) throw Error('指定的优先行不在当前订单范围内，请核实原表行号。');
     // Explicitly prioritized order rows share the same residual ledger.
     for (const row of cfg.priorityRows || []) { const o = orders.find(t => t.row === row && t.sheet === os); if (!o || !valid(o)) continue; for (const m of index.get(o.key) || []) { if (m.issue) continue; const amount = min(o.remaining, m.remaining); if (amount > 0n) allocate(o, m, amount); if (!o.remaining) break; } }
@@ -347,7 +355,7 @@
     const scopedOrders = cfg.customer ? orders.filter(o => norm(o.customer) === norm(cfg.customer)) : orders;
     if (scopedOrders.length >= 50 && scopedOrders.filter(o => index.has(o.key)).length / scopedOrders.length < 0.05) blockers.push('当前范围同键匹配率低于5%，请检查工作表、表头、DD号、图号及客户映射；尚未确认原因，禁止批量写入');
     const sheetStats = contexts.map(c => {const rows=results.filter(r=>r.orderPath===c.sheet.path);return {name:c.sheet.name,path:c.sheet.path,state:c.sheet.state,header:c.header,map:c.map,customer:c.customer,totalOrders:rows.length,full:rows.filter(r=>r.status==='full').length,partial:rows.filter(r=>r.status==='partial').length,review:rows.filter(r=>r.status==='review').length,missing:rows.filter(r=>r.status==='missing').length,newQuantity:fmt(rows.reduce((sum,r)=>sum+qty(r.added),0n)),changes:orderSheetChanges.get(c.sheet.path).size};});
-    const diagnostics = { orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
+    const diagnostics = { orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
     return { sheetChanges:[new Map([[ms.path,changes[0]]]),orderSheetChanges], diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
   }
   function replaceCells(sheet, changes, strings) {
@@ -407,6 +415,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.07.6', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.07.7', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);
