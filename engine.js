@@ -1,5 +1,6 @@
 (function (root) {
   'use strict';
+  const Catalog = root.WorkbenchCatalog || (typeof require === 'function' ? require('./catalog.js') : null);
   const SCALE = 1000000n;
   const norm = v => String(v ?? '').replace(/\s+/g, '').toUpperCase();
   const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -132,20 +133,27 @@
     const names = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '十一', '十二'];
     return text.replace(/(十二|十一|十|九|八|七|六|五|四|三|二|一)月/g, (_, n) => (names.indexOf(n) + 1) + '月').replace(/(\d{1,2})內厂/g, '$1月厂');
   }
-  function parseHistory(text, total, month, continuous, unit = '', process = '') {
+  function parseHistory(text, total, month, continuous, unit = '', process = '', suppliers = [], currentVendor = '厂内') {
     const raw = numberMonth(norm(text)); if (!raw) return { used: 0n, current: 0n, entries: [] };
+    const vendors = Catalog.unique(['厂内',...Catalog.defaultSuppliers,...suppliers]).map(norm);
+    const escapePattern = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const suffix = '(?:喷粉|喷漆|喷|丝印|组装|压铆|打胶)?(?:以对|已对|对)?([\\d.]+)?(?:件|张|套)?';
+    const pattern = new RegExp('^(\\d{1,2})月(' + vendors.map(escapePattern).sort((a,b)=>b.length-a.length).join('|') + ')' + suffix + '$');
+    const tailPattern = new RegExp('^' + suffix + '$');
     const parts = raw.split(/[,，;；\n]+/).filter(Boolean); let used = 0n, current = 0n, last = null; const entries = [];
     for (const part of parts) {
-      let m = part.match(/^(\d{1,2})月(厂内|达康|天跃|祺隆|众创)(?:喷粉|喷漆|喷)?(?:以对|已对|对)?([\d.]+)?(?:件|张|套)?$/);
+      let m = part.match(pattern);
+      if (m) {const tail=part.slice((m[1]+'月').length);if(vendors.filter(v=>tail.startsWith(v)&&tailPattern.test(tail.slice(v.length))).length>1)throw Error('历史供应商名称与数量边界不明确：'+text);}
       if (!m && continuous && last && /^[\d.]+(?:件|张|套)?$/.test(part)) m = ['', last.month, last.vendor, part.replace(/[件张套]/g, '')];
       if (!m) throw Error('历史标注无法确定数量：' + text);
-      const writtenProcess = part.match(/喷粉|喷漆|丝印|组装|压铆|打胶/)?.[0];
+      const historyTail = part.startsWith(m[1]+'月'+m[2]) ? part.slice((m[1]+'月'+m[2]).length) : part;
+      const writtenProcess = historyTail.match(/喷粉|喷漆|丝印|组装|压铆|打胶/)?.[0];
       if (process && writtenProcess && writtenProcess !== process) throw Error('历史原文明示其他工序，需核实：' + text);
-      const writtenUnit = part.match(/(件|张|套)$/)?.[1];
+      const writtenUnit = historyTail.match(/(件|张|套)$/)?.[1];
       if (writtenUnit && ((unit && norm(unit) !== writtenUnit) || (!unit && writtenUnit !== '件'))) throw Error('历史单位与原数量单位不明或不一致：' + text);
       const mo = +m[1]; if (mo < 1 || mo > 12 || mo > month) throw Error('历史月份超出本次口径：' + text);
       const q = m[3] ? qty(m[3]) : total; if (q < 0n) throw Error('历史数量异常');
-      used += q; if (mo === month && m[2] === '厂内') current += q;
+      used += q; if (mo === month && norm(m[2]) === norm(currentVendor)) current += q;
       last = { month: m[1], vendor: m[2] }; entries.push({ month: mo, vendor: m[2], quantity: fmt(q), full: !m[3] });
     }
     if (used > total) throw Error('历史已核销数量超过原数量');
@@ -199,6 +207,17 @@
     if (detected.candidates.some(c => c.column === map.mark && /喷粉|喷漆|丝印|组装|压铆|打胶/.test(c.header) && !norm(c.header).includes(norm(process)))) throw Error(label + '核销列属于其他工序');
     if ((sheet.merges || []).some(m => colNo(map.mark) >= m.c1 && colNo(map.mark) <= m.c2 && m.r2 > +header)) throw Error(label + '核销目标含合并数据格，需人工确认');
   }
+  function inferCustomerColumn(sheet,map,header,customers) {
+    const known=new Set(customers.map(norm).filter(Boolean));if(!known.size)return '';
+    const counts=new Map(),titles=sheet.byRow.get(+header)?.values||{};
+    const excluded=new Set(['dd','code','quantity','mark','name','unit'].map(key=>map[key]).filter(Boolean));
+    for(const row of sheet.rows)if(row.row>+header&&(row.values[map.dd]||row.values[map.code]))for(const [column,value] of Object.entries(row.values)){
+      if(excluded.has(column)||/消单|消單|核销|核銷|喷粉|喷漆|丝印|组装|压铆|打胶|备注|備註|数量|數量|价格|價格|金额|金額|单价|單價|日期|图号|圖號|物料|DD/i.test(titles[column]||''))continue;
+      if(known.has(norm(value)))counts.set(column,(counts.get(column)||0)+1);
+    }
+    if(counts.size>1)throw Error('订单“'+sheet.name+'”存在多个可能的客户列：'+[...counts.keys()].map(c=>c+'列“'+(titles[c]||'空白表头')+'”').join('、')+'，请明确选择客户列。');
+    return counts.keys().next().value||'';
+  }
   function orderContexts(wb, cfg, selected) {
     const included = [], skipped = [];
     let wanted = null;
@@ -208,6 +227,7 @@
       wanted = new Set(cfg.orderSheetPaths);
     }
     for (const sheet of wb.sheets) {
+      if (cfg.targetKind === 'factories' && !Catalog.isFactory(sheet.name)) {skipped.push({name:sheet.name,path:sheet.path,reason:Catalog.isAuxiliary(sheet.name)?'汇总或说明页原样保留':'供应商工作表，本次厂内核销不参与',reasonCode:'not-factory'});continue;}
       if (wanted ? !wanted.has(sheet.path) : !cfg.allOrderSheets && sheet !== selected) {skipped.push({name:sheet.name,path:sheet.path,reason:'本次未选择该厂区，原样保留',reasonCode:'not-selected'});continue;}
 
       const d = detect(sheet, 'order', cfg.process), saved = cfg.orderConfigs?.[sheet.path];
@@ -222,9 +242,11 @@
       const map = {...(isSelected ? cfg.orderMap : saved?.map || d.map)};
       const header = isSelected ? cfg.orderHeader : saved?.header || d.headerEnd || d.headerRow;
       const customer = isSelected ? cfg.orderCustomer : saved?.customer || '';
-      if (!map.customer && !customer && cfg.orderFactoryIsCustomer) map.customer = d.map.factory || '';
+      let customerSource=map.customer?'column':customer?'worksheet':'';
+      if (!map.customer && !customer && cfg.orderFactoryIsCustomer) {map.customer=d.map.factory||'';if(map.customer)customerSource='factory-column';}
+      if(!map.customer&&!customer){map.customer=inferCustomerColumn(sheet,map,header,[...(cfg.customers||[]),cfg.materialCustomer||'']);if(map.customer)customerSource='customer-values';}
       validateSheetMapping(sheet, map, header, '订单“' + sheet.name + '”', cfg.process, customer);
-      included.push({sheet,map,header,customer});
+      included.push({sheet,map,header,customer,customerSource});
     }
     if (!included.length) throw Error('没有可核对的订单明细工作表，请检查工作表与字段。');
     return {included,skipped};
@@ -264,7 +286,7 @@
       allIndex.get(sourceKey).push(evidence);
       const t = { row: row.row, values: row.values, customer, dd, code, key, name: row.values[mm.name] || '', old: row.values[mm.mark] || '', added: 0n, remaining: 0n, issue: '', total: 0n, used: 0n, current: 0n };
       t.skipHistory = /^[+-]?\d+(?:\.\d+)?$/.test(String(t.old).trim());
-      try { t.total = qty(row.values[mm.quantity]); if (t.total <= 0n) throw Error('厂内数量非正数'); if (t.skipHistory) throw Error('纯数字错误历史按本次口径跳过，原格保留，不参与可用量'); const h = parseHistory(t.old, t.total, cfg.month, cfg.continuous, row.values[mm.unit] || '', cfg.process); Object.assign(t, h); t.remaining = t.total - t.used; } catch (e) { t.issue = e.message; }
+      try { t.total = qty(row.values[mm.quantity]); if (t.total <= 0n) throw Error('厂内数量非正数'); if (t.skipHistory) throw Error('纯数字错误历史按本次口径跳过，原格保留，不参与可用量'); const h = parseHistory(t.old, t.total, cfg.month, cfg.continuous, row.values[mm.unit] || '', cfg.process, cfg.suppliers || []); Object.assign(t, h); t.remaining = t.total - t.used; } catch (e) { t.issue = e.message; }
       if (!norm(customer)) t.issue = '厂内客户缺失，不能跨客户借量';
       if (row.formulas.has(mm.mark)) t.issue = '核销目标格含公式，不允许覆盖';
       material.push(t); if (!index.has(key)) index.set(key, []); index.get(key).push(t);
@@ -301,15 +323,17 @@
       if (mats.some(m => m.issue && !m.skipHistory)) group.forEach(o => { o.issue ||= '同键厂内历史或字段不明确：' + mats.filter(m => m.issue).map(m => '第' + m.row + '行 ' + m.issue).join('；'); });
     }
     const valid = t => !t.issue && t.remaining > 0n;
-    function allocate(o, m, amount) {
+    function allocate(o, m, amount, rule='同客户DD号图号分配') {
       if (amount <= 0n || amount > o.remaining || amount > m.remaining || m.issue) throw Error('分配台账校验失败，已停止写入。');
       o.remaining -= amount; o.added += amount; m.remaining -= amount; m.added += amount;
-      const f = { customer: o.customer, materialFile: materialWb.name, materialSheet: ms.name, materialPath: ms.path, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
+      const f = { rule, customer: o.customer, materialFile: materialWb.name, materialSheet: ms.name, materialPath: ms.path, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
     }
     if ((cfg.priorityRows || []).length && !contexts.some(c=>c.sheet===os)) throw Error('优先行对应的工作表“'+os.name+'”本次未勾选，请勾选该厂区或清空优先行。');
     if ((cfg.priorityRows || []).some(row => !orders.some(o => o.row === row && o.sheet === os))) throw Error('指定的优先行不在当前订单范围内，请核实原表行号。');
     // Explicitly prioritized order rows share the same residual ledger.
     for (const row of cfg.priorityRows || []) { const o = orders.find(t => t.row === row && t.sheet === os); if (!o || !valid(o)) continue; for (const m of index.get(o.key) || []) { if (m.issue) continue; const amount = min(o.remaining, m.remaining); if (amount > 0n) allocate(o, m, amount); if (!o.remaining) break; } }
+    // User rule: matching name and remaining quantity precede all generic DD+code allocation.
+    for (const o of orders.filter(valid)) {if(!norm(o.name))continue;const m=(index.get(o.key)||[]).find(t=>!t.issue&&norm(t.name)===norm(o.name)&&t.remaining===o.remaining);if(m)allocate(o,m,o.remaining,'DD号图号名称余量一致优先');}
     // 1. Balanced groups, 2. exact remaining row quantities, 3. cross-row residual allocation.
     for (const [key, group] of orderIndex) {
       const mats = index.get(key) || [], active = group.filter(valid); if (!active.length || mats.some(t => t.issue)) continue;
@@ -354,7 +378,7 @@
     Object.assign(stats, { newQuantity: fmt(sm), materialChanges: changes[0].size, orderChanges: changes[1].size, groups: affected.size, totalOrders: orders.length, totalMaterial: material.length });
     const scopedOrders = cfg.customer ? orders.filter(o => norm(o.customer) === norm(cfg.customer)) : orders;
     if (scopedOrders.length >= 50 && scopedOrders.filter(o => index.has(o.key)).length / scopedOrders.length < 0.05) blockers.push('当前范围同键匹配率低于5%，请检查工作表、表头、DD号、图号及客户映射；尚未确认原因，禁止批量写入');
-    const sheetStats = contexts.map(c => {const rows=results.filter(r=>r.orderPath===c.sheet.path);return {name:c.sheet.name,path:c.sheet.path,state:c.sheet.state,header:c.header,map:c.map,customer:c.customer,totalOrders:rows.length,full:rows.filter(r=>r.status==='full').length,partial:rows.filter(r=>r.status==='partial').length,review:rows.filter(r=>r.status==='review').length,missing:rows.filter(r=>r.status==='missing').length,newQuantity:fmt(rows.reduce((sum,r)=>sum+qty(r.added),0n)),changes:orderSheetChanges.get(c.sheet.path).size};});
+    const sheetStats = contexts.map(c => {const rows=results.filter(r=>r.orderPath===c.sheet.path);return {name:c.sheet.name,path:c.sheet.path,state:c.sheet.state,header:c.header,map:c.map,customer:c.customer,customerSource:c.customerSource,totalOrders:rows.length,full:rows.filter(r=>r.status==='full').length,partial:rows.filter(r=>r.status==='partial').length,review:rows.filter(r=>r.status==='review').length,missing:rows.filter(r=>r.status==='missing').length,newQuantity:fmt(rows.reduce((sum,r)=>sum+qty(r.added),0n)),changes:orderSheetChanges.get(c.sheet.path).size};});
     const diagnostics = { orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
     return { sheetChanges:[new Map([[ms.path,changes[0]]]),orderSheetChanges], diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
   }
@@ -415,6 +439,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.07.7', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.09.1', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);

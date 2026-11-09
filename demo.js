@@ -8,6 +8,7 @@ window.makeExample = async function () {
     zip.file('xl/_rels/workbook.xml.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>');
     const content=rows.map((row,i)=>'<row r="'+(i+1)+'">'+row.map((v,j)=>typeof v==='number'?'<c r="'+String.fromCharCode(65+j)+(i+1)+'"><v>'+v+'</v></c>':'<c r="'+String.fromCharCode(65+j)+(i+1)+'" t="inlineStr"><is><t>'+esc(v)+'</t></is></c>').join('')+'</row>').join('');
     zip.file('xl/worksheets/sheet1.xml','<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>'+content+'</sheetData></worksheet>');
+    if(name.includes('订单'))zip.file('xl/workbook.xml',(await zip.file('xl/workbook.xml').async('string')).replace('name="核销示例"','name="一厂"'));
     return new File([await zip.generateAsync({type:'uint8array'})],name);
   }
   return [await book('示例_厂内物料.xlsx',[
