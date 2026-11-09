@@ -7,3 +7,5 @@
 #party-settings h3 { margin:12px 0; }
 #party-settings #customer-choice { width:100%; }
 #customer-add, #customer-list { margin-top:12px; }
+#project-picker .project-option { display:flex; gap:9px; padding:7px 4px; cursor:pointer; }
+#project-picker .project-option input { min-height:0; flex:none; }

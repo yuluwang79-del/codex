@@ -1,4 +1,4 @@
-importScripts('vendor/jszip.min.js', 'catalog.js?v=20261109.3', 'engine.js?v=20261109.3');
+importScripts('vendor/jszip.min.js', 'catalog.js?v=20261109.4', 'engine.js?v=20261109.4');
 const books = new Map(); let result = null;
 self.onmessage = async ({ data }) => {
   const { id, action } = data;

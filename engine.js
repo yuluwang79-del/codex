@@ -257,12 +257,27 @@
     if (!included.length&&!skipped.some(s=>/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''))) throw Error('没有可核对的订单明细工作表，请检查工作表与字段。');
     return {included,skipped};
   }
-  function deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error){
+  function deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error,deferredSources){
     const reason=error.message+'；本次跳过，原表保留待审核';
     const skippedOrderSheets=orderWb.sheets.filter(s=>(cfg.targetKind!=='factories'||Catalog.isFactory(s.name))&&(cfg.orderSheetPaths?cfg.orderSheetPaths.includes(s.path):cfg.allOrderSheets||s===os)).map(s=>({name:s.name,path:s.path,rows:Math.max(0,s.rows.length-1),reason:'本次厂内资料关键字段不齐，未核销、原样保留',reasonCode:'material-fields-incomplete'}));
     const stats={full:0,partial:0,missing:0,review:0,unchanged:0,newQuantity:'0',materialChanges:0,orderChanges:0,groups:0,totalOrders:0,totalMaterial:0,deferredSheets:skippedOrderSheets.length,deferredRows:skippedOrderSheets.reduce((n,s)=>n+s.rows,0)};
-    const diagnostics={deferredMaterialSheets:[{name:ms.name,path:ms.path,reason,reasonCode:'material-fields-incomplete'}],deferredOrderSheets:skippedOrderSheets,orderSheets:[],skippedOrderSheets,allCustomersDeferred:false,allDataDeferred:true,sharedMaterialLedger:true,blockers:[],customers:[],reasonCounts:{},matchedBeforeFilter:0,matchedAfterFilter:0,scopedOrderCount:0,materialFile:materialWb.name,orderFile:orderWb.name,materialSheet:ms.name,orderSheet:os.name,materialHeader:cfg.materialHeader,orderHeader:cfg.orderHeader,materialMap:cfg.materialMap,orderMap:cfg.orderMap,customer:cfg.customer||'',month:cfg.month,process:cfg.process};
+    const diagnostics={deferredMaterialSheets:deferredSources||[{name:ms.name,path:ms.path,reason,reasonCode:'material-fields-incomplete'}],deferredOrderSheets:skippedOrderSheets,orderSheets:[],skippedOrderSheets,allCustomersDeferred:false,allDataDeferred:true,sharedMaterialLedger:true,blockers:[],customers:[],reasonCounts:{},matchedBeforeFilter:0,matchedAfterFilter:0,scopedOrderCount:0,materialFile:materialWb.name,orderFile:orderWb.name,materialSheet:ms.name,orderSheet:os.name,materialHeader:cfg.materialHeader,orderHeader:cfg.orderHeader,materialMap:cfg.materialMap,orderMap:cfg.orderMap,customer:cfg.customer||'',month:cfg.month,process:cfg.process};
     return {config:cfg,stats,diagnostics,results:[],flows:[],changes:[new Map(),new Map()],sheetChanges:[new Map(),new Map()],materialWb,orderWb,sheets:[ms,os],verified:true,exportVerified:false};
+  }
+  function materialContexts(wb,cfg,selected){
+    const multiple=cfg.materialSheetPaths!==undefined,paths=multiple?cfg.materialSheetPaths:[selected.path];
+    if(!Array.isArray(paths)||new Set(paths).size!==paths.length||paths.some(path=>!wb.sheets.some(sh=>sh.path===path)))throw Error('项目对应的厂内工作表无效或重复。');
+    const included=[],skipped=[];
+    for(const sheet of wb.sheets)if(paths.includes(sheet.path)){
+      if(paths.length>1&&Catalog.isAuxiliary(sheet.name)&&wb.sheets.some(other=>paths.includes(other.path)&&!Catalog.isAuxiliary(other.name))){skipped.push({name:sheet.name,path:sheet.path,reason:'本次已选明细资料，汇总/说明页保留原样，避免与明细重复抵扣',reasonCode:'material-auxiliary'});continue;}
+      const d=detect(sheet,'material',cfg.process),saved=cfg.materialConfigs?.[sheet.path],current=sheet===selected;
+      const map={...(current?cfg.materialMap:saved?.map||d.map)},header=current?cfg.materialHeader:saved?.header||d.headerEnd||d.headerRow;
+      const customer=current?cfg.materialCustomer:saved?.customer||(map.customer?'':sheet.name);
+      try{validateSheetMapping(sheet,map,header,'厂内“'+sheet.name+'”',cfg.process,customer);included.push({sheet,map,header,customer});}
+      catch(error){if(error.code!=='MISSING_MAPPING')throw error;skipped.push({name:sheet.name,path:sheet.path,reason:error.message+'；本次跳过待审核',reasonCode:'material-fields-incomplete',error});}
+    }
+    if(!paths.length)for(const name of cfg.selectedProjects||[])skipped.push({name,path:'',reason:'所选项目没有对应的厂内资料，本次跳过待审核',reasonCode:'material-project-not-provided'});
+    return {included,skipped};
   }
   function analyze(materialWb, orderWb, options) {
     const cfg = { month: 9, year: 2026, process: '喷粉', factory: '', continuous: false, ...options };
@@ -271,9 +286,11 @@
     if (!ms || !os) throw Error('请确认两份文件的工作表。');
     const mm = cfg.materialMap, om = cfg.orderMap;
     if (materialWb.bytes.length === orderWb.bytes.length && materialWb.bytes.every((b,i) => b === orderWb.bytes[i])) throw Error('两份文件内容完全相同，请上传厂内物料总表及对应订单，不能将同一份表互相核销。');
-    try{validateSheetMapping(ms,mm,cfg.materialHeader,'厂内“'+ms.name+'”',cfg.process,cfg.materialCustomer);}catch(error){if(error.code!=='MISSING_MAPPING')throw error;return deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error);}
-    const {included:contexts,skipped:skippedOrderSheets} = orderContexts(orderWb, cfg, os);
-    const orderSheetChanges = new Map(contexts.map(c => [c.sheet.path,new Map()]));
+    const {included:materialSources,skipped:deferredMaterialSheets}=materialContexts(materialWb,cfg,ms);
+    if(!materialSources.length){const error=deferredMaterialSheets[0]?.error||Error(deferredMaterialSheets[0]?.reason||'厂内项目资料未提供');return deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error,deferredMaterialSheets.map(({error,...info})=>info));}
+    const materialSheetChanges=new Map(materialSources.map(c=>[c.sheet.path,new Map()]));
+    const materialChangeKey=m=>cfg.materialSheetPaths!==undefined?m.sheet.path+'!'+m.map.mark+m.row:m.map.mark+m.row;
+    const projectNames=Array.isArray(cfg.selectedProjects)&&cfg.selectedProjects.length?new Set(cfg.selectedProjects.map(norm)):null;
     const orderChangeKey = o => cfg.allOrderSheets || cfg.orderSheetPaths !== undefined ? o.sheet.path + '!' + o.map.mark + o.row : o.map.mark + o.row;
     const customerOf = (row, map, fixed, sheet) => {
       if (!map.customer) return String(fixed || '').trim();
@@ -289,22 +306,29 @@
     const allIndex = new Map(), excluded = [], blockers = [];
     const material = [], orders = [], index = new Map(), orderIndex = new Map(), changes = [new Map(), new Map()], flows = [];
     const monthText = cfg.month + '月', stats = { full: 0, partial: 0, missing: 0, review: 0, unchanged: 0, newQuantity: '0', materialChanges: 0, orderChanges: 0, groups: 0 };
-    for (const row of ms.rows) {
-      if (row.row <= +cfg.materialHeader || (!row.values[mm.dd] && !row.values[mm.code])) continue;
+    for(const source of materialSources){
+     const {sheet:materialSheet,map:mm,header,customer:fixedCustomer}=source;
+     for (const row of materialSheet.rows) {
+      if (row.row <= +header || (!row.values[mm.dd] && !row.values[mm.code])) continue;
       const dd = row.values[mm.dd] || '', code = row.values[mm.code] || '';
-      const customer = customerOf(row, mm, cfg.materialCustomer, ms), key = scopedKey(customer, dd, code);
+      const customer = customerOf(row, mm, fixedCustomer, materialSheet), key = scopedKey(customer, dd, code);
+      if(projectNames&&!projectNames.has(norm(materialSheet.name))&&!projectNames.has(norm(customer)))continue;
       const sourceKey = keyOf(dd, code), rawFactory = row.values[mm.factory] || '';
-      const evidence = { row: row.row, factory: rawFactory, customer, cell: mm.mark + row.row };
+      const evidence = { sheet:materialSheet.name,path:materialSheet.path,row: row.row, factory: rawFactory, customer, cell: mm.mark + row.row };
       if (!allIndex.has(sourceKey)) allIndex.set(sourceKey, []);
       allIndex.get(sourceKey).push(evidence);
-      const t = { row: row.row, values: row.values, customer, dd, code, key, name: row.values[mm.name] || '', old: row.values[mm.mark] || '', added: 0n, remaining: 0n, issue: '', total: 0n, used: 0n, current: 0n };
+      const t = { sheet:materialSheet,map:mm,unit:row.values[mm.unit]||'',id:materialSheet.path+'!'+row.row,row: row.row, values: row.values, customer, dd, code, key, name: row.values[mm.name] || '', old: row.values[mm.mark] || '', added: 0n, remaining: 0n, issue: '', total: 0n, used: 0n, current: 0n };
       t.skipHistory = /^[+-]?\d+(?:\.\d+)?$/.test(String(t.old).trim());
       try { t.total = qty(row.values[mm.quantity]); if (t.total <= 0n) throw Error('厂内数量非正数'); if (t.skipHistory) throw Error('纯数字错误历史按本次口径跳过，原格保留，不参与可用量'); const h = parseHistory(t.old, t.total, cfg.month, cfg.continuous, row.values[mm.unit] || '', cfg.process, cfg.suppliers || []); Object.assign(t, h); t.remaining = t.total - t.used; } catch (e) { t.issue = e.message; }
       if (!norm(customer)) t.issue = '厂内客户缺失，不能跨客户借量';
       if (row.formulas.has(mm.mark)) t.issue = '核销目标格含公式，不允许覆盖';
       material.push(t); if (!index.has(key)) index.set(key, []); index.get(key).push(t);
     }
-    const materialCustomers=new Set([...material.map(m=>norm(m.customer)),...(!mm.customer?[norm(cfg.materialCustomer)]:[])].filter(Boolean));
+    }
+    const materialCustomers=new Set([...material.map(m=>norm(m.customer)),...materialSources.filter(c=>!c.map.customer&&(!projectNames||projectNames.has(norm(c.sheet.name))||projectNames.has(norm(c.customer)))).map(c=>norm(c.customer))].filter(Boolean));
+    const projectCustomers=projectNames?new Set([...projectNames,...materialCustomers]):null;
+    const {included:contexts,skipped:skippedOrderSheets}=orderContexts(orderWb,{...cfg,customers:[...(cfg.customers||[]),...materialCustomers]},os);
+    const orderSheetChanges=new Map(contexts.map(c=>[c.sheet.path,new Map()]));
     const customerDeferred=o=>['customer-unidentified','customer-data-not-provided','customer-filtered'].includes(o.issueCode);
     for (const context of contexts) {
      const {sheet:orderSheet,map:om,header,customer:fixedCustomer} = context;
@@ -316,7 +340,7 @@
       const sp = special(row, om); if (sp) t.issue = sp;
       if (row.formulas.has(om.mark)) t.issue = '核销目标格含公式，不允许覆盖';
       if(!norm(customer)){t.issue='客户未识别，本次跳过，保留原标注';t.issueCode='customer-unidentified';}
-      else if(cfg.customer&&norm(customer)!==norm(cfg.customer)){t.issue='不在本次选定客户“'+cfg.customer+'”范围，本次跳过，保留原状';t.issueCode='customer-filtered';}
+      else if(projectCustomers?!projectCustomers.has(norm(customer)):cfg.customer&&norm(customer)!==norm(cfg.customer)){t.issue='不在本次勾选项目或客户范围，本次跳过，保留原状';t.issueCode='customer-filtered';}
       else if(!materialCustomers.has(norm(customer))){t.issue='客户“'+customer+'”的厂内资料本次未提供，已跳过；保留原标注，待后续资料再核对';t.issueCode='customer-data-not-provided';}
       orders.push(t); if (!orderIndex.has(key)) orderIndex.set(key, []); orderIndex.get(key).push(t);
     }
@@ -328,7 +352,7 @@
       if (marked > supply) { group.forEach(t => { t.issue = '已有本月订单核销量大于厂内同键本月记录，保留整组核实'; }); (index.get(key) || []).forEach(t => { t.issue = '两表已有本月记录不一致'; }); }
     }
     for (const [key, group] of orderIndex) {
-      const mats = index.get(key) || []; const mu = new Set(mats.map(t => norm(t.values[mm.unit])).filter(Boolean)), ou = new Set(group.map(t => norm(t.unit)).filter(Boolean));
+      const mats = index.get(key) || []; const mu = new Set(mats.map(t => norm(t.unit)).filter(Boolean)), ou = new Set(group.map(t => norm(t.unit)).filter(Boolean));
       if (mu.size && ou.size && new Set([...mu, ...ou]).size > 1) { group.forEach(t => { t.issue = '同键两表单位不一致，禁止自动换算'; }); mats.forEach(t => { t.issue = '同键单位不一致'; }); }
     }
     for (const [key, group] of orderIndex) {
@@ -343,7 +367,7 @@
     function allocate(o, m, amount, rule='同客户DD号图号分配') {
       if (amount <= 0n || amount > o.remaining || amount > m.remaining || m.issue) throw Error('分配台账校验失败，已停止写入。');
       o.remaining -= amount; o.added += amount; m.remaining -= amount; m.added += amount;
-      const f = { rule, customer: o.customer, materialFile: materialWb.name, materialSheet: ms.name, materialPath: ms.path, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
+      const f = { rule, customer: o.customer, materialFile: materialWb.name, materialSheet: m.sheet.name, materialPath: m.sheet.path, materialCell: m.map.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
     }
     const prioritySheetDeferred=skippedOrderSheets.some(s=>s.path===os.path&&/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''));
     if (!prioritySheetDeferred&&(cfg.priorityRows || []).length && !contexts.some(c=>c.sheet===os)) throw Error('优先行对应的工作表“'+os.name+'”本次未勾选，请勾选该厂区或清空优先行。');
@@ -364,7 +388,7 @@
     const append = (old, text) => old ? old + '，' + text : text;
     for (const m of material) if (m.added > 0n) {
       const label = m.old ? append(m.old, monthText + '厂内' + fmt(m.added)) : m.added === m.total ? monthText + '厂内' : monthText + '厂内对' + fmt(m.added) + '件';
-      changes[0].set(mm.mark + m.row, { before: m.old, after: label, quantity: fmt(m.added), row: m.row });
+      const change={before:m.old,after:label,quantity:fmt(m.added),row:m.row};changes[0].set(materialChangeKey(m),change);materialSheetChanges.get(m.sheet.path).set(m.map.mark+m.row,change);
     }
     const results = [];
     for (const o of orders) {
@@ -384,7 +408,7 @@
       if (label !== o.old && !o.issue) {const change={before:o.old,after:label,row:o.row,quantity:fmt(o.added)};changes[1].set(orderChangeKey(o),change);orderSheetChanges.get(o.sheet.path).set(o.map.mark+o.row,change);}
       stats[status]++;
       const mats = index.get(o.key) || [];
-      results.push({ deferred:customerDeferred(o), id: o.id, orderSheet: o.sheet.name, orderPath: o.sheet.path, customer: o.customer, scopeEvidence: (allIndex.get(keyOf(o.dd, o.code)) || []).map(m => ({ ...m, inScope: !!norm(o.customer) && norm(m.customer) === norm(o.customer) })), reasonCode: o.issue ? o.issueCode || 'history-or-fields-unclear' : !mats.length ? 'no-key' : o.added > 0n ? 'allocated' : o.applied > 0n ? 'existing' : 'exhausted', row: o.row, dd: o.dd, code: o.code, name: o.name, quantity: o.total > 0n ? fmt(o.total) : o.values[om.quantity] || '', previous: fmt(o.applied), added: fmt(o.added), remaining: fmt(o.remaining), status, reason, before: o.old, after: label, changed: changes[1].has(orderChangeKey(o)), cell: o.map.mark + o.row, allocations: o.flows, material: mats.map(m => ({ historyUsed: fmt(m.used), currentHistory: fmt(m.current), historyEntries: m.entries || [], row: m.row, name: m.name, quantity: m.total > 0n ? fmt(m.total) : m.values[mm.quantity] || '', before: m.old, after: changes[0].get(mm.mark + m.row)?.after || m.old, added: fmt(m.added), remaining: fmt(m.remaining), issue: m.issue, cell: mm.mark + m.row })) });
+      results.push({ deferred:customerDeferred(o), id: o.id, orderSheet: o.sheet.name, orderPath: o.sheet.path, customer: o.customer, scopeEvidence: (allIndex.get(keyOf(o.dd, o.code)) || []).map(m => ({ ...m, inScope: !!norm(o.customer) && norm(m.customer) === norm(o.customer) })), reasonCode: o.issue ? o.issueCode || 'history-or-fields-unclear' : !mats.length ? 'no-key' : o.added > 0n ? 'allocated' : o.applied > 0n ? 'existing' : 'exhausted', row: o.row, dd: o.dd, code: o.code, name: o.name, quantity: o.total > 0n ? fmt(o.total) : o.values[om.quantity] || '', previous: fmt(o.applied), added: fmt(o.added), remaining: fmt(o.remaining), status, reason, before: o.old, after: label, changed: changes[1].has(orderChangeKey(o)), cell: o.map.mark + o.row, allocations: o.flows, material: mats.map(m => ({ sheet:m.sheet.name,path:m.sheet.path,id:m.id,historyUsed: fmt(m.used), currentHistory: fmt(m.current), historyEntries: m.entries || [], row: m.row, name: m.name, quantity: m.total > 0n ? fmt(m.total) : m.values[m.map.quantity] || '', before: m.old, after: changes[0].get(materialChangeKey(m))?.after || m.old, added: fmt(m.added), remaining: fmt(m.remaining), issue: m.issue, cell: m.map.mark + m.row })) });
     }
     const sm = material.reduce((q, t) => q + t.added, 0n), so = orders.reduce((q, t) => q + t.added, 0n), sf = flows.reduce((q, f) => q + qty(f.quantity), 0n);
     if (sm !== so || so !== sf || material.some(m => !m.issue && (m.remaining < 0n || m.added + m.used > m.total)) || orders.some(o => !o.issue && o.added + o.applied > o.total)) throw Error('两表数量校验未通过，禁止导出。');
@@ -394,13 +418,14 @@
       const left = (index.get(key) || []).reduce((q, m) => q + m.added, 0n), right = (orderIndex.get(key) || []).reduce((q, o) => q + o.added, 0n); if (left !== right) throw Error('分组数量不一致');
     }
     Object.assign(stats, { newQuantity: fmt(sm), materialChanges: changes[0].size, orderChanges: changes[1].size, groups: affected.size, totalOrders: orders.length, totalMaterial: material.length });
-    const scopedOrders = orders.filter(o=>(!cfg.customer||norm(o.customer)===norm(cfg.customer))&&!customerDeferred(o));
+    const scopedOrders = orders.filter(o=>(projectCustomers?projectCustomers.has(norm(o.customer)):!cfg.customer||norm(o.customer)===norm(cfg.customer))&&!customerDeferred(o));
     const deferredOrderSheets=skippedOrderSheets.filter(s=>/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''));
     Object.assign(stats,{deferredSheets:deferredOrderSheets.length,deferredRows:results.filter(r=>r.deferred).length+deferredOrderSheets.reduce((sum,s)=>sum+(s.rows||0),0)});
     if (scopedOrders.length >= 50 && scopedOrders.filter(o => index.has(o.key)).length / scopedOrders.length < 0.05) blockers.push('当前范围同键匹配率低于5%，请检查工作表、表头、DD号、图号及客户映射；尚未确认原因，禁止批量写入');
     const sheetStats = contexts.map(c => {const rows=results.filter(r=>r.orderPath===c.sheet.path);return {name:c.sheet.name,path:c.sheet.path,state:c.sheet.state,header:c.header,map:c.map,customer:c.customer,customerSource:c.customerSource,totalOrders:rows.length,full:rows.filter(r=>r.status==='full').length,partial:rows.filter(r=>r.status==='partial').length,review:rows.filter(r=>r.status==='review').length,deferred:rows.filter(r=>r.deferred).length,missing:rows.filter(r=>r.status==='missing').length,newQuantity:fmt(rows.reduce((sum,r)=>sum+qty(r.added),0n)),changes:orderSheetChanges.get(c.sheet.path).size};});
-    const diagnostics = {deferredMaterialSheets:[],deferredOrderSheets,allCustomersDeferred:!scopedOrders.length&&(stats.deferredRows>0||stats.deferredSheets>0),deferredPriorityRows:prioritySheetDeferred?(cfg.priorityRows||[]):[],materialCustomers:[...materialCustomers],orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
-    return { sheetChanges:[new Map([[ms.path,changes[0]]]),orderSheetChanges], diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
+    const unavailableProjects=(cfg.selectedProjects||[]).filter(name=>!materialSources.some(c=>norm(c.sheet.name)===norm(name)||norm(c.customer)===norm(name))&&!materialCustomers.has(norm(name))&&!deferredMaterialSheets.some(c=>norm(c.name)===norm(name)));
+    const diagnostics = {unavailableProjects,selectedProjects:cfg.selectedProjects||[],materialSheets:materialSources.map(c=>({name:c.sheet.name,path:c.sheet.path,header:c.header,map:c.map,customer:c.customer,newQuantity:fmt(material.filter(m=>m.sheet===c.sheet).reduce((sum,m)=>sum+m.added,0n)),changes:materialSheetChanges.get(c.sheet.path).size})),deferredMaterialSheets:deferredMaterialSheets.map(({error,...info})=>info),deferredOrderSheets,allCustomersDeferred:!scopedOrders.length&&(stats.deferredRows>0||stats.deferredSheets>0),deferredPriorityRows:prioritySheetDeferred?(cfg.priorityRows||[]):[],materialCustomers:[...materialCustomers],orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
+    return { sheetChanges:[materialSheetChanges,orderSheetChanges], diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
   }
   function replaceCells(sheet, changes, strings) {
     if (!changes.size) return sheet.xml;
@@ -459,6 +484,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.09.3', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.09.4', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);
