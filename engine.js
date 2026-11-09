@@ -192,7 +192,7 @@
     return '';
   }
   function validateSheetMapping(sheet, map, header, label, process, fixedCustomer) {
-    for (const key of ['dd', 'code', 'quantity', 'mark']) if (!map?.[key]) throw Error(label + '缺少字段：' + ({dd:'DD号',code:'图号／物料号',quantity:'数量',mark:'核销标注列'})[key] + '。请切到该工作表确认映射。');
+    for (const key of ['dd', 'code', 'quantity', 'mark']) if (!map?.[key]) {const error=Error(label + '缺少字段：' + ({dd:'DD号',code:'图号／物料号',quantity:'数量',mark:'核销标注列'})[key]);error.code='MISSING_MAPPING';error.field=key;throw error;}
     if (new Set(['dd','code','quantity','mark'].map(key => map[key])).size !== 4) throw Error(label + '的关键字段不能映射到同一列。');
     if (!Number.isInteger(+header) || +header < 1) throw Error(label + '表头行无效');
     for (const column of Object.values(map).filter(Boolean)) if (!/^[A-Z]{1,3}$/.test(column)) throw Error(label + '字段列号无效');
@@ -236,7 +236,7 @@
       const summary = (cfg.allOrderSheets || wanted) && /汇总|统计|说明|封面|合计/.test(sheet.name);
       if (summary || (!isSelected && !saved && coreCount === 0)) {
         const hasDD = sheet.rows.some(r=>Object.values(r.values).some(v=>/^DD[0-9]/i.test(norm(v))));
-        if (!summary && hasDD) throw Error('订单“'+sheet.name+'”含DD记录但无法识别表头，请切到该工作表确认映射。');
+        if(!summary&&hasDD){skipped.push({name:sheet.name,path:sheet.path,rows:Math.max(0,sheet.rows.length-1),reason:'含DD记录但表头和关键字段不齐，本次跳过并列为待审核',reasonCode:'order-fields-incomplete'});continue;}
         skipped.push({name:sheet.name,path:sheet.path,reason:summary?'汇总或说明工作表，不与明细重复抵扣':'未识别订单字段，作为非订单工作表保留'});continue;
       }
       const map = {...(isSelected ? cfg.orderMap : saved?.map || d.map)};
@@ -251,11 +251,18 @@
       }
       if(!map.customer&&!norm(customer)){skipped.push({name:sheet.name,path:sheet.path,rows:deferredRows(),reason:'客户未识别，本次跳过；保留原表，待相应客户资料提供后另批核对',reasonCode:'customer-unidentified'});continue;}
 
-      validateSheetMapping(sheet, map, header, '订单“' + sheet.name + '”', cfg.process, customer);
+      try{validateSheetMapping(sheet,map,header,'订单“'+sheet.name+'”',cfg.process,customer);}catch(error){if(error.code!=='MISSING_MAPPING')throw error;skipped.push({name:sheet.name,path:sheet.path,rows:deferredRows(),reason:error.message+'；本次跳过，原表保留待审核',reasonCode:'order-fields-incomplete'});continue;}
       included.push({sheet,map,header,customer,customerSource});
     }
-    if (!included.length&&!skipped.some(s=>/^customer-/.test(s.reasonCode||''))) throw Error('没有可核对的订单明细工作表，请检查工作表与字段。');
+    if (!included.length&&!skipped.some(s=>/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''))) throw Error('没有可核对的订单明细工作表，请检查工作表与字段。');
     return {included,skipped};
+  }
+  function deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error){
+    const reason=error.message+'；本次跳过，原表保留待审核';
+    const skippedOrderSheets=orderWb.sheets.filter(s=>(cfg.targetKind!=='factories'||Catalog.isFactory(s.name))&&(cfg.orderSheetPaths?cfg.orderSheetPaths.includes(s.path):cfg.allOrderSheets||s===os)).map(s=>({name:s.name,path:s.path,rows:Math.max(0,s.rows.length-1),reason:'本次厂内资料关键字段不齐，未核销、原样保留',reasonCode:'material-fields-incomplete'}));
+    const stats={full:0,partial:0,missing:0,review:0,unchanged:0,newQuantity:'0',materialChanges:0,orderChanges:0,groups:0,totalOrders:0,totalMaterial:0,deferredSheets:skippedOrderSheets.length,deferredRows:skippedOrderSheets.reduce((n,s)=>n+s.rows,0)};
+    const diagnostics={deferredMaterialSheets:[{name:ms.name,path:ms.path,reason,reasonCode:'material-fields-incomplete'}],deferredOrderSheets:skippedOrderSheets,orderSheets:[],skippedOrderSheets,allCustomersDeferred:false,allDataDeferred:true,sharedMaterialLedger:true,blockers:[],customers:[],reasonCounts:{},matchedBeforeFilter:0,matchedAfterFilter:0,scopedOrderCount:0,materialFile:materialWb.name,orderFile:orderWb.name,materialSheet:ms.name,orderSheet:os.name,materialHeader:cfg.materialHeader,orderHeader:cfg.orderHeader,materialMap:cfg.materialMap,orderMap:cfg.orderMap,customer:cfg.customer||'',month:cfg.month,process:cfg.process};
+    return {config:cfg,stats,diagnostics,results:[],flows:[],changes:[new Map(),new Map()],sheetChanges:[new Map(),new Map()],materialWb,orderWb,sheets:[ms,os],verified:true,exportVerified:false};
   }
   function analyze(materialWb, orderWb, options) {
     const cfg = { month: 9, year: 2026, process: '喷粉', factory: '', continuous: false, ...options };
@@ -264,7 +271,7 @@
     if (!ms || !os) throw Error('请确认两份文件的工作表。');
     const mm = cfg.materialMap, om = cfg.orderMap;
     if (materialWb.bytes.length === orderWb.bytes.length && materialWb.bytes.every((b,i) => b === orderWb.bytes[i])) throw Error('两份文件内容完全相同，请上传厂内物料总表及对应订单，不能将同一份表互相核销。');
-    validateSheetMapping(ms, mm, cfg.materialHeader, '厂内“' + ms.name + '”', cfg.process, cfg.materialCustomer);
+    try{validateSheetMapping(ms,mm,cfg.materialHeader,'厂内“'+ms.name+'”',cfg.process,cfg.materialCustomer);}catch(error){if(error.code!=='MISSING_MAPPING')throw error;return deferredMaterialResult(materialWb,orderWb,cfg,ms,os,error);}
     const {included:contexts,skipped:skippedOrderSheets} = orderContexts(orderWb, cfg, os);
     const orderSheetChanges = new Map(contexts.map(c => [c.sheet.path,new Map()]));
     const orderChangeKey = o => cfg.allOrderSheets || cfg.orderSheetPaths !== undefined ? o.sheet.path + '!' + o.map.mark + o.row : o.map.mark + o.row;
@@ -338,7 +345,7 @@
       o.remaining -= amount; o.added += amount; m.remaining -= amount; m.added += amount;
       const f = { rule, customer: o.customer, materialFile: materialWb.name, materialSheet: ms.name, materialPath: ms.path, materialCell: mm.mark + m.row, orderFile: orderWb.name, orderSheet: o.sheet.name, orderPath: o.sheet.path, orderCell: o.map.mark + o.row, month: cfg.month, process: cfg.process, materialRow: m.row, orderRow: o.row, dd: o.dd, code: o.code, quantity: fmt(amount) }; flows.push(f); o.flows.push(f);
     }
-    const prioritySheetDeferred=skippedOrderSheets.some(s=>s.path===os.path&&/^customer-/.test(s.reasonCode||''));
+    const prioritySheetDeferred=skippedOrderSheets.some(s=>s.path===os.path&&/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''));
     if (!prioritySheetDeferred&&(cfg.priorityRows || []).length && !contexts.some(c=>c.sheet===os)) throw Error('优先行对应的工作表“'+os.name+'”本次未勾选，请勾选该厂区或清空优先行。');
     if (!prioritySheetDeferred&&(cfg.priorityRows || []).some(row => !orders.some(o => o.row === row && o.sheet === os))) throw Error('指定的优先行不在当前订单范围内，请核实原表行号。');
     // Explicitly prioritized order rows share the same residual ledger.
@@ -388,11 +395,11 @@
     }
     Object.assign(stats, { newQuantity: fmt(sm), materialChanges: changes[0].size, orderChanges: changes[1].size, groups: affected.size, totalOrders: orders.length, totalMaterial: material.length });
     const scopedOrders = orders.filter(o=>(!cfg.customer||norm(o.customer)===norm(cfg.customer))&&!customerDeferred(o));
-    const deferredOrderSheets=skippedOrderSheets.filter(s=>/^customer-/.test(s.reasonCode||''));
+    const deferredOrderSheets=skippedOrderSheets.filter(s=>/^customer-|^order-fields-incomplete$/.test(s.reasonCode||''));
     Object.assign(stats,{deferredSheets:deferredOrderSheets.length,deferredRows:results.filter(r=>r.deferred).length+deferredOrderSheets.reduce((sum,s)=>sum+(s.rows||0),0)});
     if (scopedOrders.length >= 50 && scopedOrders.filter(o => index.has(o.key)).length / scopedOrders.length < 0.05) blockers.push('当前范围同键匹配率低于5%，请检查工作表、表头、DD号、图号及客户映射；尚未确认原因，禁止批量写入');
     const sheetStats = contexts.map(c => {const rows=results.filter(r=>r.orderPath===c.sheet.path);return {name:c.sheet.name,path:c.sheet.path,state:c.sheet.state,header:c.header,map:c.map,customer:c.customer,customerSource:c.customerSource,totalOrders:rows.length,full:rows.filter(r=>r.status==='full').length,partial:rows.filter(r=>r.status==='partial').length,review:rows.filter(r=>r.status==='review').length,deferred:rows.filter(r=>r.deferred).length,missing:rows.filter(r=>r.status==='missing').length,newQuantity:fmt(rows.reduce((sum,r)=>sum+qty(r.added),0n)),changes:orderSheetChanges.get(c.sheet.path).size};});
-    const diagnostics = {deferredOrderSheets,allCustomersDeferred:!scopedOrders.length&&(stats.deferredRows>0||stats.deferredSheets>0),deferredPriorityRows:prioritySheetDeferred?(cfg.priorityRows||[]):[],materialCustomers:[...materialCustomers],orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
+    const diagnostics = {deferredMaterialSheets:[],deferredOrderSheets,allCustomersDeferred:!scopedOrders.length&&(stats.deferredRows>0||stats.deferredSheets>0),deferredPriorityRows:prioritySheetDeferred?(cfg.priorityRows||[]):[],materialCustomers:[...materialCustomers],orderScope:cfg.orderSheetPaths!==undefined?'selected':cfg.allOrderSheets?'all':'current', orderSheets:sheetStats, skippedOrderSheets, sharedMaterialLedger:true, reasonCounts: results.reduce((counts, row) => { counts[row.reasonCode] = (counts[row.reasonCode] || 0) + 1; return counts; }, {}), year: cfg.year, matchedBeforeFilter: orders.filter(o => allIndex.has(keyOf(o.dd, o.code))).length, matchedAfterFilter: orders.filter(o => index.has(o.key)).length, excluded: results.flatMap(o => o.scopeEvidence.filter(m => !m.inScope).map(m => ({ orderSheet:o.orderSheet,orderPath:o.orderPath,orderRow: o.row, ...m }))), blockers, materialFile: materialWb.name, orderFile: orderWb.name, materialSheet: ms.name, orderSheet: os.name, materialHeader: cfg.materialHeader, orderHeader: cfg.orderHeader, materialMap: mm, orderMap: om, customers: [...new Set(orders.map(o => o.customer).filter(Boolean))], selectedCustomer: cfg.customer || '全部客户（逐客户隔离）', scopedOrderCount: scopedOrders.length, customerPolicy: '客户一致；制造部门仅供参考，不限制厂内加工范围', materialCustomer: cfg.materialCustomer || '', orderCustomer: cfg.orderCustomer || '', month: cfg.month, process: cfg.process };
     return { sheetChanges:[new Map([[ms.path,changes[0]]]),orderSheetChanges], diagnostics, config: cfg, stats, results, flows, changes, materialWb, orderWb, sheets: [ms, os], verified: true, exportVerified: false };
   }
   function replaceCells(sheet, changes, strings) {
@@ -452,6 +459,6 @@
     }
     result.exportVerified = true; return output;
   }
-  const API = { version: '2026.11.09.2', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
+  const API = { version: '2026.11.09.3', readWorkbook, metadata, detect, analyze, exportResult, qty, fmt, norm, parseHistory, parseOrderMark, replaceCells };
   root.ReconcileEngine = API; if (typeof module !== 'undefined' && module.exports) module.exports = API;
 })(typeof globalThis !== 'undefined' ? globalThis : self);

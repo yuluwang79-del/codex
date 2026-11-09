@@ -29,11 +29,11 @@ test('customers remain isolated across factories; factory/customer-header semant
  const m=await stock([[5]]),headFactory=['DD号','物料','数量','已对数量','厂区'];const o=await multiBook('客户厂区.xlsx',[{name:'一厂',rows:[headFactory,row(3)]},{name:'二厂',rows:[headFactory,row(3)]},{name:'三厂',rows:[headFactory,row(8,'','其他客户')]}]);
  const settings={...cfg,orderMap:{dd:'A',code:'B',quantity:'C',mark:'D',customer:'E',factory:'E'},orderFactoryIsCustomer:true};const r=E.analyze(m,o,settings);assert.equal(r.stats.newQuantity,'5');assert.deepEqual(r.results.map(x=>x.added),['3','2','0']);assert.equal(r.results[2].status,'review');assert(!r.sheetChanges[1].get(o.sheets[2].path).size);await exportedRerun(r,settings);
 });
-test('summary sheets are retained and listed, never consumed along with detail; invalid detail targets block the batch',async()=>{
+test('summary sheets are retained and listed, never consumed along with detail; incomplete detail sheets are deferred',async()=>{
  const m=await stock([[5]]),o=await multiBook('汇总及明细.xlsx',[{name:'汇总',rows:[head,row(99)]},{name:'五厂',rows:[head,row(5)]},{name:'说明',rows:[['使用说明']]}]);
  const r=E.analyze(m,o,cfg);assert.equal(r.stats.totalOrders,1);assert.equal(r.stats.newQuantity,'5');assert.equal(r.diagnostics.skippedOrderSheets.length,2);assert.equal(r.results[0].orderSheet,'五厂');await exportedRerun(r);
- const bad=await multiBook('未识别列.xlsx',[{name:'一厂',rows:[head,row(1)]},{name:'六厂',rows:[['DD号','物料','数量','备注','客户'],row(1)]}]);assert.throws(()=>E.analyze(m,bad,cfg),/六厂.*缺少字段.*核销/);
- const damaged=await multiBook('表头错误.xlsx',[{name:'一厂',rows:[head,row(1)]},{name:'六厂',rows:[['未知表头'],['DD001','A',1]]}]);assert.throws(()=>E.analyze(m,damaged,cfg),/六厂.*含DD记录.*确认映射/);
+ const bad=await multiBook('未识别列.xlsx',[{name:'一厂',rows:[head,row(1)]},{name:'六厂',rows:[['DD号','物料','数量','备注','客户'],row(1)]}]);const deferred=E.analyze(m,bad,cfg);assert.equal(deferred.stats.newQuantity,'1');assert.match(deferred.diagnostics.deferredOrderSheets[0].reason,/六厂.*缺少字段.*核销/);
+ const damaged=await multiBook('表头错误.xlsx',[{name:'一厂',rows:[head,row(1)]},{name:'六厂',rows:[['未知表头'],['DD001','A',1]]}]);const pending=E.analyze(m,damaged,cfg);assert.equal(pending.stats.newQuantity,'1');assert.match(pending.diagnostics.deferredOrderSheets[0].reason,/含DD记录.*待审核/);
 });
 test('visiting another factory mapping does not lose confirmed factory-as-customer semantics; explicit sheet customer overrides stay intact',async()=>{
  const m=await stock([[5]]),o=await multiBook('访问过映射的订单.xlsx',[{name:'一厂',rows:[['DD号','物料','数量','已对数量','厂区'],row(3)]},{name:'二厂',rows:[['DD号','物料','数量','已对数量','厂区'],row(3)]}]);
@@ -53,5 +53,5 @@ test('multi-select shares residual in workbook order and validates empty, unknow
 });
 test('unselected malformed factory does not block a valid chosen factory or get modified',async()=>{
  const m=await stock([[5]]),o=await multiBook('未选坏表.xlsx',[{name:'一厂',rows:[head,row(2)]},{name:'二厂',rows:[['DD号','物料','数量','备注','客户'],row(2)]}]);
- const chosen={...cfg,orderSheetPaths:[o.sheets[0].path]};const r=E.analyze(m,o,chosen);assert.equal(r.stats.newQuantity,'2');const out=await exportedRerun(r,chosen);assert.equal(out[1].sheets[1].xml,o.sheets[1].xml);assert.throws(()=>E.analyze(m,o,{...cfg,orderSheetPaths:[o.sheets[1].path]}),/二厂.*核销/);
+ const chosen={...cfg,orderSheetPaths:[o.sheets[0].path]};const r=E.analyze(m,o,chosen);assert.equal(r.stats.newQuantity,'2');const out=await exportedRerun(r,chosen);assert.equal(out[1].sheets[1].xml,o.sheets[1].xml);const pending=E.analyze(m,o,{...cfg,orderSheetPaths:[o.sheets[1].path]});assert.equal(pending.stats.newQuantity,'0');assert.equal(pending.stats.deferredSheets,1);
 });

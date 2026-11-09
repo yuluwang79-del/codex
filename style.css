@@ -5,3 +5,5 @@
 #party-settings input, #party-settings select { max-width:100%; min-height:36px; border:1px solid #d8e1d6; border-radius:6px; padding:6px 8px; background:#fff; }
 #party-settings td { padding:8px; white-space:normal; }
 #party-settings h3 { margin:12px 0; }
+#party-settings #customer-choice { width:100%; }
+#customer-add, #customer-list { margin-top:12px; }
