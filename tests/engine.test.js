@@ -93,7 +93,7 @@ test('fully consumed historical material is exhausted, without rewriting prior m
 test('customer is required even with DD+code match; an unrelated customer cannot supply or consume history',async()=>{
  const [mw,ow]=await pair([m(5)],[o(5)]);
  assert.throws(()=>E.analyze(mw,ow,{...options,materialCustomer:'',orderCustomer:''}),/未识别客户列/);
- const r=E.analyze(mw,ow,{...options,materialCustomer:'客户甲',orderCustomer:'客户乙'});assert.equal(r.stats.newQuantity,'0');assert.equal(r.stats.review,1);assert.equal(r.results[0].reasonCode,'customer-mismatch');assert.equal(r.changes[0].size+r.changes[1].size,0);
+ const r=E.analyze(mw,ow,{...options,materialCustomer:'客户甲',orderCustomer:'客户乙'});assert.equal(r.stats.newQuantity,'0');assert.equal(r.stats.review,1);assert.equal(r.results[0].reasonCode,'customer-data-not-provided');assert.equal(r.changes[0].size+r.changes[1].size,0);
 });
 test('customer columns partition identical DD+code; equal customer spans departments but never other customers',async()=>{
  const mw=await book('客户物料.xlsx',[['专案名称','图号','数量','喷粉','厂区','客户'],['DD001','A',4,'','一厂','甲'],['DD001','A',6,'','二厂','甲'],['DD001','A',100,'','三厂','乙']]);
