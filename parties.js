@@ -1,12 +1,14 @@
 (function(root){
  'use strict';
  const $=id=>document.getElementById(id);
- const C=root.WorkbenchCatalog,key='outsourced-workbench-parties-v1';let entries=C.empty();
+ const C=root.WorkbenchCatalog,key='outsourced-workbench-parties-v1';let entries=C.empty(),sessionSuppliers=[];
  try{entries=C.restore(localStorage.getItem(key)||'{}');}catch{}
- function suppliers(){const o=state[1];return C.unique([...C.defaultSuppliers,...entries.suppliers,...(o?o.meta.sheets.filter(s=>!C.isFactory(s.name)&&!C.isAuxiliary(s.name)).map(s=>s.name):[])]);}
+ function suppliers(){const o=state[1];return C.unique([...C.defaultSuppliers,...entries.suppliers,...sessionSuppliers,...(o?o.meta.sheets.filter(s=>!C.isFactory(s.name)&&!C.isAuxiliary(s.name)&&!C.factories.some(n=>C.norm(s.name).startsWith(C.norm(n)))&&!/^(?:SHEET|工作表)\d*$/i.test(C.norm(s.name))).map(s=>s.name):[])]);}
  function customers(){return C.customerUnique([...C.defaultCustomers,...entries.customers]);}
+ function producers(){const clients=C.customerUnique([...customers(),...state.filter(Boolean).flatMap(s=>s.meta.sheets.flatMap(sh=>sh.customers||[]))]);return C.unique(['厂内',...suppliers().filter(name=>C.defaultSuppliers.some(n=>C.norm(n)===C.norm(name))||entries.suppliers.some(n=>C.norm(n)===C.norm(name))||!clients.some(n=>C.customerKey(n)===C.customerKey(name)))]);}
  function persist(){try{localStorage.setItem(key,JSON.stringify(entries));return true;}catch{return false;}}
  function render(){
+  const producer=$('producer').value||'厂内';$('producer').innerHTML=producers().map(name=>`<option value="${esc(name)}">${esc(name)}</option>`).join('');$('producer').value=producer;if(!$('producer').value)$('producer').value='厂内';
   const options=state[1]?.meta.sheets.filter(s=>!C.isFactory(s.name)&&!C.isAuxiliary(s.name))||[];
   $('supplier-sheet').innerHTML='<option value="">上传后绑定工作表（可稍后选择）</option>'+options.map(s=>`<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
   $('supplier-catalog').innerHTML='<table><thead><tr><th>供应商名称</th><th>对应订单工作表</th><th></th></tr></thead><tbody>'+suppliers().map(name=>{const match=entries.supplierSheets[name]||options.find(s=>C.norm(s.name)===C.norm(name))?.name||'';return `<tr><td>${esc(name)}</td><td><select data-supplier-binding="${esc(name)}"><option value="">未绑定</option>${options.map(s=>`<option value="${esc(s.name)}" ${s.name===match?'selected':''}>${esc(s.name)}</option>`).join('')}</select></td><td>${entries.suppliers.includes(name)?`<button class="button secondary small" data-remove-supplier="${esc(name)}">移除选项</button>`:'已从工作表或历史名单识别'}</td></tr>`}).join('')+'</tbody></table>';
@@ -22,5 +24,5 @@
  $('customer-form').addEventListener('submit',e=>{e.preventDefault();if(busy)return;try{const input=$('customer-name').value;if(customers().some(n=>C.customerKey(n)===C.customerKey(input)))throw Error('该客户已在名单中：'+C.customerName(input));const name=C.add(entries,'customers',input);const saved=persist();$('customer-name').value='';$('customer-add').open=false;invalidate();renderFiles();notify('已添加项目“'+name+'”。'+(saved?'新增选项保存在当前浏览器，原Excel不变。':'浏览器无法保存，选项暂用于本次会话。'));}catch(error){notify(error.message,true);}});
  $('party-settings').addEventListener('click',e=>{if(busy)return;const use=e.target.closest('[data-use-customer]');if(use){selectCustomer(use.dataset.useCustomer);return;}const remove=e.target.closest('[data-remove-supplier]');if(remove){entries.suppliers=entries.suppliers.filter(n=>n!==remove.dataset.removeSupplier);delete entries.supplierSheets[remove.dataset.removeSupplier];persist();invalidate();renderFiles();}});
  $('party-settings').addEventListener('change',e=>{const name=e.target.dataset.supplierBinding;if(!name||busy)return;entries.supplierSheets[name]=e.target.value;persist();invalidate();});
- root.Parties={render,suppliers,customers};
+ root.Parties={render,suppliers,producers,customers,rememberSuppliers:()=>{sessionSuppliers=C.unique([...sessionSuppliers,...suppliers()]);}};
 })(window);
