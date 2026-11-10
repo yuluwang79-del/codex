@@ -2,7 +2,7 @@
  'use strict';
  const factories=Object.freeze(['一厂','二厂','三厂','五厂','六厂','总厂']);
  const defaultSuppliers=Object.freeze(['达康','天跃','祺隆','众创']);
- const defaultCustomers=Object.freeze(['海天精工','海天塑机','赛尔富','公牛','乐仑','兴泰','埃利','荣特','君灵','东英吉利','蓓灵']);
+ const defaultCustomers=Object.freeze(['海天精工','海天塑机','赛尔富','公牛','乐仝','兴泰','埃利','荣特','君灵','东英吉利','蓓灵']);
  const norm=value=>String(value??'').replace(/\s+/g,'').toUpperCase();
  const unique=values=>[...new Map(values.filter(v=>typeof v==='string'&&v.trim()).map(v=>[norm(v),v.trim()])).values()];
  const customerName=value=>{const raw=String(value??'').trim(),key=norm(raw);return ['海天精工','海天塑机'].find(name=>key.endsWith(name))||raw;};

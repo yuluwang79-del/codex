@@ -8,7 +8,7 @@ const settings={...options,materialMap:map,orderMap:map,materialCustomer:'',orde
 async function roundtrip(m,o,cfg){const r=E.analyze(m,o,cfg),files=await E.exportResult(r),out=await Promise.all(files.map(f=>E.readWorkbook(f.bytes,f.name)));const again=E.analyze(...out,cfg);assert.equal(again.stats.newQuantity,'0');assert.equal(again.changes[0].size+again.changes[1].size,0);return {r,out};}
 
 test('customer names use the agreed shortlist and only the two confirmed final suffixes are canonicalized',()=>{
- assert.deepEqual([...C.defaultCustomers],['海天精工','海天塑机','赛尔富','公牛','乐仑','兴泰','埃利','荣特','君灵','东英吉利','蓓灵']);
+ assert.deepEqual([...C.defaultCustomers],['海天精工','海天塑机','赛尔富','公牛','乐仝','兴泰','埃利','荣特','君灵','东英吉利','蓓灵']);
  for(const name of ['海天精工','海外-海天精工','春晓装配-海天精工','五分厂- 海天 精工 '])assert.equal(C.customerName(name),'海天精工');
  for(const name of ['海天塑机','海外-海天塑机','五分厂-海天塑机'])assert.equal(C.customerName(name),'海天塑机');
  for(const name of ['海天精工-售后','海天塑机配件','海天金属','装配-公牛',''])assert.equal(C.customerName(name),name);
